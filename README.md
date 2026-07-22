@@ -60,12 +60,24 @@ loginctl enable-linger $USER
 
 ---
 
-## Service Management Commands
+## Service Management & Unmounting
 
 - **Check Status**: `systemctl --user status rclone-gdrive.service`
 - **Restart Mount**: `systemctl --user restart rclone-gdrive.service`
-- **Stop Mount**: `systemctl --user stop rclone-gdrive.service`
+- **Stop/Unmount Service**: `systemctl --user stop rclone-gdrive.service`
+- **Disable Auto-Start**: `systemctl --user disable --now rclone-gdrive.service`
 - **View Logs**: `tail -f ~/.cache/rclone/rclone.log`
+
+### Manual Unmount Commands
+
+If you ever need to manually unmount outside of `systemd`:
+```bash
+# Normal unmount
+fusermount -u ~/mnt/google_drive
+
+# Force / Lazy unmount (if busy)
+fusermount -u -z ~/mnt/google_drive
+```
 
 ---
 

@@ -37,11 +37,12 @@ echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 ```
 
 ### 2. Configure Rclone Remote
-If you haven't already authenticated Google Drive:
-```bash
-rclone config
+When running `./setup_gdrive_mount.sh`, the script will ask:
+```text
+No rclone config found. Do you want to SCP your existing rclone config from another server? (y/N):
 ```
-Create a new remote named `gdrive`.
+- **If you answer `y`**: Enter your source server (e.g. `ubuntu@192.168.1.50` or `my-server`). The script automatically copies `~/.config/rclone/rclone.conf` from the remote machine via `scp`.
+- **If you answer `n`**: The script launches `rclone config` so you can set up Google Drive interactively.
 
 ### 3. Deploy Systemd User Service
 Copy the service file:

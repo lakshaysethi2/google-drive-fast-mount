@@ -16,7 +16,7 @@ Automated installer and `systemd` user service configuration to mount Google Dri
 Clone this repository and run the setup script:
 
 ```bash
-git clone git@github.com:lakshaypbtech/google-drive-fast-mount.git
+git clone git@github.com:lakshaysethi/google-drive-fast-mount.git
 cd google-drive-fast-mount
 chmod +x setup_gdrive_mount.sh
 ./setup_gdrive_mount.sh

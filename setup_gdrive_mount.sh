@@ -10,6 +10,8 @@ REMOTE_NAME="gdrive"
 SERVICE_NAME="rclone-gdrive"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 CACHE_DIR="${HOME}/.cache/rclone"
+RCLONE_CONF_DIR="${HOME}/.config/rclone"
+RCLONE_CONF="${RCLONE_CONF_DIR}/rclone.conf"
 
 echo "=== Google Drive Fast Mount Installer ==="
 
@@ -41,8 +43,28 @@ if [ -f /etc/fuse.conf ]; then
     fi
 fi
 
-# 3. Check for rclone configuration
-RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
+# 3. Handle Rclone Configuration & Optional SCP Import
+mkdir -p "${RCLONE_CONF_DIR}"
+
+if [ -f "$RCLONE_CONF" ]; then
+    echo "[✓] Existing rclone configuration found at ${RCLONE_CONF}."
+    read -p "Do you want to re-import/overwrite rclone config via SCP from another server? (y/N): " USE_SCP
+else
+    read -p "No rclone config found. Do you want to SCP your existing rclone config from another server? (y/N): " USE_SCP
+fi
+
+if [[ "$USE_SCP" =~ ^[Yy]$ ]]; then
+    read -p "Enter source SSH user and server (e.g. ubuntu@192.168.1.50 or my-server): " REMOTE_SERVER
+    if [ -n "$REMOTE_SERVER" ]; then
+        echo "[+] Fetching ${RCLONE_CONF} from ${REMOTE_SERVER}:~/.config/rclone/rclone.conf..."
+        scp "${REMOTE_SERVER}:~/.config/rclone/rclone.conf" "${RCLONE_CONF}"
+        echo "[✓] Successfully copied rclone.conf via SCP!"
+    else
+        echo "[!] No server specified. Skipping SCP."
+    fi
+fi
+
+# If rclone.conf is still missing or remote doesn't exist, prompt for rclone config
 if [ ! -f "$RCLONE_CONF" ] || ! grep -q "\[${REMOTE_NAME}\]" "$RCLONE_CONF"; then
     echo "[!] Remote '${REMOTE_NAME}' not found in ${RCLONE_CONF}."
     echo "[+] Running 'rclone config' to set up '${REMOTE_NAME}'..."

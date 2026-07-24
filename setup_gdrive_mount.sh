@@ -143,8 +143,9 @@ Type=simple
 ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --config ${RCLONE_CONF} \\
     --vfs-cache-mode full \\
-    --vfs-cache-max-size 10G \\
-    --vfs-cache-max-age 24h \\
+    --vfs-cache-max-size 5G \\
+    --vfs-cache-max-age 4h \\
+    --vfs-cache-poll-interval 5m \\
     --allow-other \\
     --poll-interval 1m \\
     --dir-cache-time 1000h \\

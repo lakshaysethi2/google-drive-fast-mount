@@ -142,8 +142,7 @@ do_setup() {
 
     MOUNT_FLAGS=""
     if [ "$READ_ONLY" = true ]; then
-        MOUNT_FLAGS="
-    --read-only \\"
+        MOUNT_FLAGS=" --read-only"
         echo "[i] Mounting in read-only mode."
     else
         echo "[i] Mounting in read-write mode."

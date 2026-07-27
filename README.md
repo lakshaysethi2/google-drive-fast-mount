@@ -6,6 +6,7 @@ Automated installer and `systemd` user service configuration to mount Google Dri
 
 - **Instant Directory Listings**: Uses `--attr-timeout 1000h` and `--dir-cache-time 1000h` so commands like `ls` finish in ~10 milliseconds.
 - **Full VFS Read/Write Caching**: Uses `--vfs-cache-mode full` for seamless read prefetching and async writes.
+- **Read-Only Mode**: Option to mount as read-only to prevent accidental modifications.
 - **Systemd User Service**: Starts automatically on boot, restarts on failure, and manages unmounting safely (`fusermount -u -z`).
 - **User Linger Enabled**: Mount stays active in the background even after SSH logout (`loginctl enable-linger`).
 
@@ -20,6 +21,12 @@ git clone https://github.com/lakshaysethi2/google-drive-fast-mount.git
 cd google-drive-fast-mount
 chmod +x setup_gdrive_mount.sh
 ./setup_gdrive_mount.sh
+```
+
+During setup, you will be prompted whether to mount as read-only. You can also pass the flag directly:
+
+```bash
+./setup_gdrive_mount.sh setup --readonly
 ```
 
 ---

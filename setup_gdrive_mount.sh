@@ -12,6 +12,7 @@ SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 CACHE_DIR="${HOME}/.cache/rclone"
 RCLONE_CONF_DIR="${HOME}/.config/rclone"
 RCLONE_CONF="${RCLONE_CONF_DIR}/rclone.conf"
+READ_ONLY=false
 
 do_unmount() {
     echo ""
@@ -132,6 +133,21 @@ do_setup() {
     SERVICE_FILE="${SYSTEMD_USER_DIR}/${SERVICE_NAME}.service"
     echo "[+] Writing systemd user service to ${SERVICE_FILE}..."
 
+    if [ "$READ_ONLY" = false ]; then
+        read -p "Mount as read-only? (y/N): " ASK_READONLY
+        if [[ "$ASK_READONLY" =~ ^[Yy]$ ]]; then
+            READ_ONLY=true
+        fi
+    fi
+
+    MOUNT_FLAGS=""
+    if [ "$READ_ONLY" = true ]; then
+        MOUNT_FLAGS=" --read-only"
+        echo "[i] Mounting in read-only mode."
+    else
+        echo "[i] Mounting in read-write mode."
+    fi
+
     cat <<EOF > "${SERVICE_FILE}"
 [Unit]
 Description=Rclone Mount for Google Drive (${REMOTE_NAME})
@@ -154,7 +170,7 @@ ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --vfs-read-chunk-size-limit 1G \\
     --buffer-size 32M \\
     --log-file ${CACHE_DIR}/rclone.log \\
-    --log-level INFO
+    --log-level INFO${MOUNT_FLAGS}
 ExecStop=/bin/fusermount -u -z ${MOUNT_DIR}
 Restart=on-failure
 RestartSec=10
@@ -185,6 +201,13 @@ EOF
 # --- CLI Arguments or Main Menu ---
 case "$1" in
     mount|setup)
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --readonly) READ_ONLY=true; shift ;;
+                *) shift ;;
+            esac
+        done
         do_setup
         ;;
     unmount|stop)

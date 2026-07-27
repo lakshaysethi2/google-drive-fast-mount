@@ -108,6 +108,27 @@ do_watch() {
 
     _fmt() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
 
+    # Bytes rclone has actually sent, from the --stats line. The dirty-file
+    # count only changes when a whole file completes, so on multi-hundred-MB
+    # files it can sit unchanged for many minutes while transfer is healthy.
+    # This is the real liveness signal.
+    _sent() {
+        local log="${CACHE_DIR}/rclone.log" line val unit
+        [ -f "$log" ] || { echo ""; return; }
+        # e.g. "Transferred:   1.234 GiB / 33 GiB, 3%, 12.345 MiB/s, ETA 40m"
+        line=$(grep -oE "Transferred:[[:space:]]+[0-9.]+ *[KMGT]?i?B?y?t?e?s? */" "$log" 2>/dev/null | tail -n1)
+        [ -n "$line" ] || { echo ""; return; }
+        val=$(echo "$line" | grep -oE "[0-9.]+" | head -n1)
+        unit=$(echo "$line" | grep -oiE "[KMGT]i?B" | head -n1)
+        case "${unit^^}" in
+            KIB|KB) awk -v v="$val" 'BEGIN{printf "%.0f", v*1024}' ;;
+            MIB|MB) awk -v v="$val" 'BEGIN{printf "%.0f", v*1048576}' ;;
+            GIB|GB) awk -v v="$val" 'BEGIN{printf "%.0f", v*1073741824}' ;;
+            TIB|TB) awk -v v="$val" 'BEGIN{printf "%.0f", v*1099511627776}' ;;
+            *)      awk -v v="$val" 'BEGIN{printf "%.0f", v}' ;;
+        esac
+    }
+
     echo ""
     echo "=== Watching Upload Backlog (Ctrl-C to stop) ==="
     echo ""
@@ -125,16 +146,28 @@ do_watch() {
     START_T=$(date +%s)
     PREV_B=$START_B
     PREV_T=$START_T
+    START_SENT=$(_sent)
+    PREV_SENT=$START_SENT
 
     while true; do
         sleep 30
         read -r N B < <(_pending)
         NOW=$(date +%s)
+        SENT=$(_sent)
 
         DT=$((NOW - PREV_T))
         DB=$((PREV_B - B))
         RATE=0
         [ "$DT" -gt 0 ] && RATE=$((DB / DT))
+
+        # Prefer live wire throughput when rclone is reporting it: it shows
+        # progress within a file, not just on completion.
+        WIRE=0
+        if [ -n "$SENT" ] && [ -n "$PREV_SENT" ] && [ "$DT" -gt 0 ]; then
+            DSENT=$((SENT - PREV_SENT))
+            [ "$DSENT" -gt 0 ] && WIRE=$((DSENT / DT))
+        fi
+        [ "$WIRE" -gt 0 ] && RATE=$WIRE
 
         # Average rate over the whole window is steadier for ETA.
         TOT_DT=$((NOW - START_T))
@@ -151,12 +184,12 @@ do_watch() {
 
         if [ "$RATE" -gt 0 ]; then
             RATE_S="$(_fmt "$RATE")/s"
-        elif [ "$TOT_DT" -lt 90 ]; then
-            # Too early to call it: a large file uploads for minutes before
-            # its dirty flag clears, so early samples legitimately show 0.
-            RATE_S="..."
+        elif [ -n "$SENT" ]; then
+            # rclone is reporting stats but no delta this interval.
+            RATE_S="idle"
         else
-            RATE_S="stalled"
+            # No completions yet and no stats to read. Normal for big files.
+            RATE_S="in-flight"
         fi
 
         printf '%-9s %8s %12s %12s %s\n' \
@@ -169,16 +202,23 @@ do_watch() {
             return 0
         fi
 
-        # Flag a genuinely stuck queue rather than a merely slow one.
-        if [ "$TOT_DT" -ge 300 ] && [ "$TOT_DB" -le 0 ]; then
+        # Only call it stalled if NOTHING moved: no file completed AND no
+        # bytes went over the wire. A large file uploading for 20 minutes
+        # completes nothing but is perfectly healthy.
+        TOT_SENT=0
+        if [ -n "$SENT" ] && [ -n "$START_SENT" ]; then
+            TOT_SENT=$((SENT - START_SENT))
+        fi
+        if [ "$TOT_DT" -ge 900 ] && [ "$TOT_DB" -le 0 ] && [ "$TOT_SENT" -le 0 ]; then
             echo ""
-            echo "[!] No progress in $((TOT_DT / 60)) minutes - uploads look stalled."
+            echo "[!] No files completed and no bytes sent in $((TOT_DT / 60)) minutes."
             echo "    Diagnose with: ./setup_gdrive_mount.sh uploads"
             return 1
         fi
 
         PREV_B=$B
         PREV_T=$NOW
+        PREV_SENT=$SENT
     done
 }
 

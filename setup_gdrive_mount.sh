@@ -14,6 +14,16 @@ RCLONE_CONF_DIR="${HOME}/.config/rclone"
 RCLONE_CONF="${RCLONE_CONF_DIR}/rclone.conf"
 READ_ONLY=false
 
+# --- VFS cache tuning (override via environment before running the script) ---
+# VFS_CACHE_MAX_SIZE      Hard-ish cap on cached file data (soft: see README).
+# VFS_CACHE_MAX_AGE       Evict cached files untouched for this long.
+# VFS_CACHE_MIN_FREE      Start evicting when the cache disk drops below this.
+# VFS_CACHE_POLL_INTERVAL How often the cleaner runs (rclone default is 1m).
+VFS_CACHE_MAX_SIZE="${VFS_CACHE_MAX_SIZE:-5G}"
+VFS_CACHE_MAX_AGE="${VFS_CACHE_MAX_AGE:-1h}"
+VFS_CACHE_MIN_FREE="${VFS_CACHE_MIN_FREE:-5G}"
+VFS_CACHE_POLL_INTERVAL="${VFS_CACHE_POLL_INTERVAL:-1m}"
+
 do_unmount() {
     echo ""
     echo "=== Unmount Options ==="
@@ -60,6 +70,92 @@ do_status() {
         echo "[✓] Mount point '${MOUNT_DIR}' is ACTIVE."
     else
         echo "[!] Mount point '${MOUNT_DIR}' is NOT mounted."
+    fi
+}
+
+do_cache() {
+    echo ""
+    echo "=== VFS Cache Usage ==="
+    VFS_DIR="${CACHE_DIR}/vfs"
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+
+    if [ ! -d "$VFS_DIR" ]; then
+        echo "[i] No VFS cache directory at ${VFS_DIR} (nothing cached yet)."
+        return 0
+    fi
+
+    # Cache files are SPARSE. `du --apparent-size` shows the full logical file
+    # size, but only the downloaded chunks occupy real blocks. Plain `du`
+    # reports real disk usage -- that is the number that matters.
+    REAL=$(du -sh "$VFS_DIR" 2>/dev/null | cut -f1)
+    APPARENT=$(du -sh --apparent-size "$VFS_DIR" 2>/dev/null | cut -f1)
+    META=$(du -sh "$VFS_META_DIR" 2>/dev/null | cut -f1)
+
+    echo "  Real disk used by cached data : ${REAL:-0}   <-- what fills your disk"
+    echo "  Apparent (sparse) size        : ${APPARENT:-0}   <-- misleading, ignore"
+    echo "  Metadata (vfsMeta)            : ${META:-0}"
+    echo ""
+    echo "  Filesystem holding the cache:"
+    df -h "${CACHE_DIR}" | sed 's/^/    /'
+    echo ""
+    echo "  Largest cached files (real usage):"
+    find "$VFS_DIR" -type f -printf '%b %p\0' 2>/dev/null \
+        | sort -z -rn \
+        | head -z -n 10 \
+        | while IFS=' ' read -r -d '' blocks path; do
+              # %b is 512-byte blocks actually allocated -> real bytes
+              printf '    %6s  %s\n' \
+                  "$(numfmt --to=iec --suffix=B $((blocks * 512)) 2>/dev/null || echo $((blocks * 512)))" \
+                  "${path#"$VFS_DIR"/}"
+          done
+    echo ""
+    echo ""
+    echo "  Rclone's own view of the cache (last cleaner run):"
+    if [ -f "${CACHE_DIR}/rclone.log" ]; then
+        grep "vfs cache: cleaned:" "${CACHE_DIR}/rclone.log" | tail -n 3 | sed 's/^/    /' \
+            || echo "    (no cleaner lines yet)"
+    else
+        echo "    (no log file yet)"
+    fi
+}
+
+do_clear_cache() {
+    echo ""
+    echo "=== Clear VFS Cache ==="
+    echo "[!] The cache can hold files that have NOT finished uploading to Drive."
+    echo "    Deleting it while those are pending means DATA LOSS."
+    echo ""
+
+    if systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
+        echo "[i] Service is running. Asking rclone to flush pending uploads first..."
+        echo "    (stopping the service triggers a clean unmount + writeback)"
+        read -p "Stop the mount and clear the cache now? (y/N): " CONFIRM
+        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            return 0
+        fi
+        systemctl --user stop "${SERVICE_NAME}.service" || true
+        # Give writeback a moment to settle after unmount.
+        sleep 2
+    else
+        read -p "Service is stopped. Clear the cache directory now? (y/N): " CONFIRM
+        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            return 0
+        fi
+    fi
+
+    if [ -d "${CACHE_DIR}/vfs" ]; then
+        rm -rf "${CACHE_DIR}/vfs" "${CACHE_DIR}/vfsMeta"
+        echo "[✓] Cleared ${CACHE_DIR}/vfs and ${CACHE_DIR}/vfsMeta"
+    else
+        echo "[i] Nothing to clear."
+    fi
+
+    read -p "Restart the mount service? (Y/n): " RESTART
+    if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
+        systemctl --user start "${SERVICE_NAME}.service"
+        echo "[✓] Service restarted."
     fi
 }
 
@@ -148,6 +244,21 @@ do_setup() {
         echo "[i] Mounting in read-write mode."
     fi
 
+    # Type=notify makes systemd wait for the mount to be ready and surfaces
+    # live VFS cache stats in `systemctl --user status`. rclone gained systemd
+    # notify support in 1.52; fall back to `simple` on anything older.
+    SERVICE_TYPE="simple"
+    RCLONE_VER=$(rclone version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+    if [ -n "$RCLONE_VER" ]; then
+        RC_MAJOR=${RCLONE_VER%%.*}
+        RC_MINOR=${RCLONE_VER##*.}
+        if [ "$RC_MAJOR" -gt 1 ] 2>/dev/null || \
+           { [ "$RC_MAJOR" -eq 1 ] && [ "$RC_MINOR" -ge 52 ]; } 2>/dev/null; then
+            SERVICE_TYPE="notify"
+        fi
+    fi
+    echo "[i] Using systemd Type=${SERVICE_TYPE} (rclone ${RCLONE_VER:-unknown})"
+
     cat <<EOF > "${SERVICE_FILE}"
 [Unit]
 Description=Rclone Mount for Google Drive (${REMOTE_NAME})
@@ -155,13 +266,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=${SERVICE_TYPE}
 ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --config ${RCLONE_CONF} \\
+    --cache-dir ${CACHE_DIR} \\
     --vfs-cache-mode full \\
-    --vfs-cache-max-size 5G \\
-    --vfs-cache-max-age 4h \\
-    --vfs-cache-poll-interval 5m \\
+    --vfs-cache-max-size ${VFS_CACHE_MAX_SIZE} \\
+    --vfs-cache-max-age ${VFS_CACHE_MAX_AGE} \\
+    --vfs-cache-min-free-space ${VFS_CACHE_MIN_FREE} \\
+    --vfs-cache-poll-interval ${VFS_CACHE_POLL_INTERVAL} \\
     --allow-other \\
     --poll-interval 1m \\
     --dir-cache-time 1000h \\
@@ -216,6 +329,12 @@ case "$1" in
     status)
         do_status
         ;;
+    cache)
+        do_cache
+        ;;
+    clear-cache)
+        do_clear_cache
+        ;;
     *)
         echo "=========================================="
         echo "   Google Drive Mount Manager & Setup"
@@ -223,15 +342,19 @@ case "$1" in
         echo "1) Setup / Start Google Drive Mount"
         echo "2) Unmount Google Drive"
         echo "3) Check Mount Status & Logs"
-        echo "4) Exit"
+        echo "4) Show VFS cache usage (real vs sparse)"
+        echo "5) Safely clear VFS cache"
+        echo "6) Exit"
         echo "=========================================="
-        read -p "Select an action [1-4]: " ACTION_CHOICE
+        read -p "Select an action [1-6]: " ACTION_CHOICE
 
         case "$ACTION_CHOICE" in
             1) do_setup ;;
             2) do_unmount ;;
             3) do_status ;;
-            4) echo "Exiting."; exit 0 ;;
+            4) do_cache ;;
+            5) do_clear_cache ;;
+            6) echo "Exiting."; exit 0 ;;
             *) echo "Invalid option."; exit 1 ;;
         esac
         ;;

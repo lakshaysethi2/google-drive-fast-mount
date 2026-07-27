@@ -4,13 +4,24 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/rclone mount gdrive: /home/ubuntu/mnt/google_drive \
-    --config /home/ubuntu/.config/rclone/rclone.conf \
+# Type=notify makes systemd wait until the mountpoint is actually ready, and
+# lets rclone publish live VFS cache stats into `systemctl --user status`.
+# If your rclone is very old and the service times out, change this to `simple`.
+Type=notify
+
+# systemd user units expand %h to the user's home directory, so this file is
+# portable across machines/users with no editing required.
+#
+# NOTE: systemd runs units without HOME/PATH, so `~` is NOT expanded by rclone.
+# --config and --cache-dir must always be absolute paths.
+ExecStart=/usr/bin/rclone mount gdrive: %h/mnt/google_drive \
+    --config %h/.config/rclone/rclone.conf \
+    --cache-dir %h/.cache/rclone \
     --vfs-cache-mode full \
     --vfs-cache-max-size 5G \
-    --vfs-cache-max-age 4h \
-    --vfs-cache-poll-interval 5m \
+    --vfs-cache-max-age 1h \
+    --vfs-cache-min-free-space 5G \
+    --vfs-cache-poll-interval 1m \
     --allow-other \
     --poll-interval 1m \
     --dir-cache-time 1000h \
@@ -18,9 +29,9 @@ ExecStart=/usr/bin/rclone mount gdrive: /home/ubuntu/mnt/google_drive \
     --vfs-read-chunk-size 32M \
     --vfs-read-chunk-size-limit 1G \
     --buffer-size 32M \
-    --log-file /home/ubuntu/.cache/rclone/rclone.log \
+    --log-file %h/.cache/rclone/rclone.log \
     --log-level INFO
-ExecStop=/bin/fusermount -u -z /home/ubuntu/mnt/google_drive
+ExecStop=/bin/fusermount -u -z %h/mnt/google_drive
 Restart=on-failure
 RestartSec=10
 

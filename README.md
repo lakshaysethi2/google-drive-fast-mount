@@ -244,6 +244,24 @@ do not. Check what is limiting yours:
 ./setup_gdrive_mount.sh speedcheck
 ```
 
+### Watching a backlog drain
+
+If files are queued for upload, track progress live:
+
+```bash
+./setup_gdrive_mount.sh watch
+```
+
+```text
+TIME         FILES    REMAINING         RATE ETA
+14:02:38       119        35GB          ... --
+14:03:08       117        34GB      12MB/s 0h48m
+```
+
+It samples every 30s, reports rate and ETA, exits `0` when the backlog clears,
+and exits `1` if nothing moves for 5 minutes so a genuinely stalled queue is
+distinguishable from a merely slow one.
+
 ### Is it safe to restart mid-upload?
 
 **Yes.** Stopping the service is a clean shutdown, not a data loss event:
@@ -309,6 +327,7 @@ slowness; `./setup_gdrive_mount.sh uploads` will identify that case.
 - **Diagnose Cache Bloat**: `./setup_gdrive_mount.sh diagnose`
 - **Pending Uploads / Failures**: `./setup_gdrive_mount.sh uploads`
 - **Upload Speed Check**: `./setup_gdrive_mount.sh speedcheck`
+- **Watch Backlog Drain**: `./setup_gdrive_mount.sh watch`
 - **Rescue Pending Data**: `./setup_gdrive_mount.sh rescue-pending <dir>`
 - **Purge Orphans (data-safe)**: `./setup_gdrive_mount.sh purge-orphans`
 - **Clear Cache**: `./setup_gdrive_mount.sh clear-cache`

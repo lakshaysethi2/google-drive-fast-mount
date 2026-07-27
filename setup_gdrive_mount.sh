@@ -87,6 +87,101 @@ do_status() {
     fi
 }
 
+do_watch() {
+    VFS_DIR="${CACHE_DIR}/vfs"
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+
+    # Count dirty (pending upload) items and their real disk bytes.
+    _pending() {
+        local n=0 b=0 meta rel src
+        [ -d "$VFS_META_DIR" ] || { echo "0 0"; return; }
+        while IFS= read -r meta; do
+            grep -q '"Dirty": true' "$meta" 2>/dev/null || continue
+            rel="${meta#"$VFS_META_DIR"/}"
+            src="${VFS_DIR}/${rel}"
+            [ -f "$src" ] || continue
+            b=$((b + $(( $(stat -c %b "$src" 2>/dev/null || echo 0) * 512 )) ))
+            n=$((n + 1))
+        done < <(find "$VFS_META_DIR" -type f 2>/dev/null)
+        echo "$n $b"
+    }
+
+    _fmt() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+
+    echo ""
+    echo "=== Watching Upload Backlog (Ctrl-C to stop) ==="
+    echo ""
+
+    read -r START_N START_B < <(_pending)
+    if [ "$START_N" -eq 0 ]; then
+        echo "[✓] Nothing pending - everything has uploaded."
+        return 0
+    fi
+
+    echo "Starting backlog: ${START_N} file(s), $(_fmt "$START_B")"
+    echo ""
+    printf '%-9s %8s %12s %12s %s\n' "TIME" "FILES" "REMAINING" "RATE" "ETA"
+
+    START_T=$(date +%s)
+    PREV_B=$START_B
+    PREV_T=$START_T
+
+    while true; do
+        sleep 30
+        read -r N B < <(_pending)
+        NOW=$(date +%s)
+
+        DT=$((NOW - PREV_T))
+        DB=$((PREV_B - B))
+        RATE=0
+        [ "$DT" -gt 0 ] && RATE=$((DB / DT))
+
+        # Average rate over the whole window is steadier for ETA.
+        TOT_DT=$((NOW - START_T))
+        TOT_DB=$((START_B - B))
+        AVG=0
+        [ "$TOT_DT" -gt 0 ] && AVG=$((TOT_DB / TOT_DT))
+
+        if [ "$AVG" -gt 0 ]; then
+            ETA_S=$((B / AVG))
+            ETA=$(printf '%dh%02dm' $((ETA_S / 3600)) $(((ETA_S % 3600) / 60)))
+        else
+            ETA="--"
+        fi
+
+        if [ "$RATE" -gt 0 ]; then
+            RATE_S="$(_fmt "$RATE")/s"
+        elif [ "$TOT_DT" -lt 90 ]; then
+            # Too early to call it: a large file uploads for minutes before
+            # its dirty flag clears, so early samples legitimately show 0.
+            RATE_S="..."
+        else
+            RATE_S="stalled"
+        fi
+
+        printf '%-9s %8s %12s %12s %s\n' \
+            "$(date +%H:%M:%S)" "$N" "$(_fmt "$B")" "$RATE_S" "$ETA"
+
+        if [ "$N" -eq 0 ]; then
+            echo ""
+            echo "[✓] Backlog cleared - all files uploaded to Drive."
+            echo "    The cache will now shrink to your --vfs-cache-max-size."
+            return 0
+        fi
+
+        # Flag a genuinely stuck queue rather than a merely slow one.
+        if [ "$TOT_DT" -ge 300 ] && [ "$TOT_DB" -le 0 ]; then
+            echo ""
+            echo "[!] No progress in $((TOT_DT / 60)) minutes - uploads look stalled."
+            echo "    Diagnose with: ./setup_gdrive_mount.sh uploads"
+            return 1
+        fi
+
+        PREV_B=$B
+        PREV_T=$NOW
+    done
+}
+
 do_speedcheck() {
     echo ""
     echo "=========================================================="
@@ -168,7 +263,8 @@ do_speedcheck() {
             echo "        (section 1) is the fix; raising --transfers will not help."
         fi
     else
-        echo "    (no log file)"
+        echo "    (no log file yet - it is created once the mount starts and"
+        echo "     transfers begin. Re-run this in a minute or two.)"
     fi
 
     # ---------------------------------------------------------------
@@ -214,7 +310,23 @@ do_uploads() {
 
     if [ ! -f "$LOG" ]; then
         echo ""
-        echo "[!] No log file at ${LOG}"
+        echo "[i] No log file at ${LOG} yet."
+        echo "    It appears once the mount starts and begins transferring."
+        echo ""
+        # A missing log doesn't mean nothing is pending - check the cache.
+        VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+        PN=0
+        if [ -d "$VFS_META_DIR" ]; then
+            while IFS= read -r M; do
+                grep -q '"Dirty": true' "$M" 2>/dev/null && PN=$((PN + 1))
+            done < <(find "$VFS_META_DIR" -type f 2>/dev/null)
+        fi
+        if [ "$PN" -gt 0 ]; then
+            echo "    ${PN} file(s) are still pending upload. Track progress with:"
+            echo "        ./setup_gdrive_mount.sh watch"
+        else
+            echo "    Nothing is pending upload."
+        fi
         return 0
     fi
 
@@ -843,6 +955,8 @@ ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --drive-pacer-min-sleep ${DRIVE_PACER_MIN_SLEEP} \\
     --drive-pacer-burst ${DRIVE_PACER_BURST} \\
     --log-file ${CACHE_DIR}/rclone.log \\
+    --stats 30s \\
+    --stats-one-line \\
     --log-level INFO${MOUNT_FLAGS}
 ExecStop=/bin/fusermount -u -z ${MOUNT_DIR}
 Restart=on-failure
@@ -903,6 +1017,9 @@ case "$1" in
         ;;
     speedcheck)
         do_speedcheck
+        ;;
+    watch)
+        do_watch
         ;;
     rescue-pending)
         shift

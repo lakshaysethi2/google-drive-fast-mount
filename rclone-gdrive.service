@@ -35,7 +35,9 @@ ExecStart=/usr/bin/rclone mount gdrive: %h/mnt/google_drive \
     --drive-pacer-min-sleep 10ms \
     --drive-pacer-burst 200 \
     --log-file %h/.cache/rclone/rclone.log \
-    --log-level INFO
+    --log-level INFO \
+    --stats 30s \
+    --stats-one-line
 ExecStop=/bin/fusermount -u -z %h/mnt/google_drive
 Restart=on-failure
 RestartSec=10

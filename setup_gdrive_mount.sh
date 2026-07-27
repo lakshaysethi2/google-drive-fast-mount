@@ -87,6 +87,105 @@ do_status() {
     fi
 }
 
+do_reupload() {
+    VFS_DIR="${CACHE_DIR}/vfs"
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+    DRY=false
+    [ "$1" = "--dry-run" ] && DRY=true
+
+    echo ""
+    echo "=========================================================="
+    echo "  Re-upload Pending Files Directly"
+    echo "=========================================================="
+    echo ""
+    echo "Use this when rclone's writeback queue is empty ('to upload 0')"
+    echo "but files on disk are still dirty - the VFS will never retry them,"
+    echo "so we push them to Drive with 'rclone copy' instead."
+    echo ""
+
+    if [ ! -d "$VFS_META_DIR" ]; then
+        echo "[i] No cache metadata; nothing to do."
+        return 0
+    fi
+
+    # The cache mirrors the remote layout under vfs/<remote>/<path>, so the
+    # path after the remote name is exactly the destination path on Drive.
+    ROOT_DIR="${VFS_DIR}/${REMOTE_NAME}"
+    if [ ! -d "$ROOT_DIR" ]; then
+        echo "[!] Expected cache root ${ROOT_DIR} does not exist."
+        echo "    Cache layout may differ; listing what is there:"
+        ls -1 "$VFS_DIR" 2>/dev/null | sed 's/^/      /'
+        return 1
+    fi
+
+    LIST=$(mktemp)
+    COUNT=0
+    BYTES=0
+    while IFS= read -r META; do
+        grep -q '"Dirty": true' "$META" 2>/dev/null || continue
+        REL="${META#"$VFS_META_DIR"/}"          # e.g. gdrive/Lib/foo.bin
+        SRC="${VFS_DIR}/${REL}"
+        [ -f "$SRC" ] || continue
+        DEST_PATH="${REL#"${REMOTE_NAME}/"}"    # strip remote name -> Lib/foo.bin
+        printf '%s\t%s\n' "$SRC" "$DEST_PATH" >> "$LIST"
+        BYTES=$((BYTES + $(( $(stat -c %b "$SRC" 2>/dev/null || echo 0) * 512 )) ))
+        COUNT=$((COUNT + 1))
+    done < <(find "$VFS_META_DIR" -type f 2>/dev/null)
+
+    if [ "$COUNT" -eq 0 ]; then
+        echo "[i] No dirty files found - nothing pending."
+        rm -f "$LIST"
+        return 0
+    fi
+
+    echo "Found ${COUNT} pending file(s), $(numfmt --to=iec --suffix=B "$BYTES" 2>/dev/null || echo "$BYTES")."
+    echo ""
+    echo "First few destinations on ${REMOTE_NAME}:"
+    head -n 5 "$LIST" | while IFS=$'\t' read -r s d; do echo "    ${d}"; done
+    [ "$COUNT" -gt 5 ] && echo "    ... and $((COUNT - 5)) more"
+    echo ""
+
+    if [ "$DRY" = true ]; then
+        echo "[dry-run] No changes made. Re-run without --dry-run to upload."
+        rm -f "$LIST"
+        return 0
+    fi
+
+    echo "[!] This uploads from the cache to Drive. It does NOT delete anything."
+    read -p "Proceed? (y/N): " OK
+    if [[ ! "$OK" =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        rm -f "$LIST"
+        return 0
+    fi
+
+    OKN=0
+    FAILN=0
+    while IFS=$'\t' read -r SRC DEST_PATH; do
+        DEST_DIR=$(dirname "$DEST_PATH")
+        [ "$DEST_DIR" = "." ] && DEST_DIR=""
+        echo "  -> ${DEST_PATH}"
+        if rclone copyto "$SRC" "${REMOTE_NAME}:${DEST_PATH}" \
+              --config "$RCLONE_CONF" \
+              --drive-chunk-size "$DRIVE_CHUNK_SIZE" \
+              --transfers 1 --stats 10s --stats-one-line 2>&1 | sed 's/^/     /'; then
+            OKN=$((OKN + 1))
+        else
+            FAILN=$((FAILN + 1))
+            echo "     [!] failed"
+        fi
+    done < "$LIST"
+    rm -f "$LIST"
+
+    echo ""
+    echo "[✓] Uploaded ${OKN}, failed ${FAILN}."
+    echo ""
+    echo "    Verify a few on Drive, then clear the stale cache entries:"
+    echo "        systemctl --user stop ${SERVICE_NAME}.service"
+    echo "        ./setup_gdrive_mount.sh clear-cache --force"
+    echo "        systemctl --user start ${SERVICE_NAME}.service"
+}
+
 do_logtail() {
     LOG="${CACHE_DIR}/rclone.log"
 
@@ -195,8 +294,14 @@ do_watch() {
     _sent() {
         local log="${CACHE_DIR}/rclone.log" line val unit
         [ -f "$log" ] || { echo ""; return; }
-        # e.g. "Transferred:   1.234 GiB / 33 GiB, 3%, 12.345 MiB/s, ETA 40m"
-        line=$(grep -oE "Transferred:[[:space:]]+[0-9.]+ *[KMGT]?i?B?y?t?e?s? */" "$log" 2>/dev/null | tail -n1)
+        # Two formats, depending on --stats-one-line:
+        #   multi-line: "Transferred:   1.234 GiB / 33 GiB, 3%, 12.3 MiB/s, ETA 40m"
+        #   one-line:   "1.234 GiB / 33 GiB, 3%, 12.3 MiB/s, ETA 40m"  (no prefix)
+        # Match the "<num> <unit> /" shape common to both, after stripping any
+        # leading timestamp/level so the date digits are never picked up.
+        line=$(grep -E "[0-9.]+ *[KMGTi]*B? */ " "$log" 2>/dev/null \
+               | sed -E 's/^[0-9\/]+ [0-9:]+[[:space:]]+[A-Z]+[[:space:]]+:[[:space:]]*//; s/^.*Transferred:[[:space:]]*//; s/^[[:space:]]+//' \
+               | grep -oE "^[0-9.]+ *[KMGT]?i?B" | tail -n1)
         [ -n "$line" ] || { echo ""; return; }
         val=$(echo "$line" | grep -oE "[0-9.]+" | head -n1)
         unit=$(echo "$line" | grep -oiE "[KMGT]i?B" | head -n1)
@@ -1143,6 +1248,10 @@ case "$1" in
         ;;
     logtail)
         do_logtail
+        ;;
+    reupload)
+        shift
+        do_reupload "$1"
         ;;
     rescue-pending)
         shift

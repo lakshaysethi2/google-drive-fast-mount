@@ -87,6 +87,86 @@ do_status() {
     fi
 }
 
+do_logtail() {
+    LOG="${CACHE_DIR}/rclone.log"
+
+    echo ""
+    echo "=========================================================="
+    echo "  Raw Mount Activity"
+    echo "=========================================================="
+
+    if [ ! -f "$LOG" ]; then
+        echo "[!] No log at ${LOG}"
+        return 1
+    fi
+
+    echo ""
+    echo "--- Log freshness ---"
+    echo "    Last written: $(date -r "$LOG" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+    echo "    Now:          $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "    Size:         $(du -h "$LOG" 2>/dev/null | cut -f1)"
+
+    # ---------------------------------------------------------------
+    # The cleaner stats line is authoritative: it reports how many
+    # items rclone itself thinks are queued and uploading. If these
+    # are 0 while files are dirty on disk, rclone is not even trying.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- rclone's own writeback queue (last 5 cleaner runs) ---"
+    CLEAN=$(grep "vfs cache: cleaned:" "$LOG" 2>/dev/null | tail -n 5)
+    if [ -z "$CLEAN" ]; then
+        echo "    (none yet - the cleaner logs once per --vfs-cache-poll-interval)"
+    else
+        echo "$CLEAN" | sed 's/.*vfs cache: cleaned: /    /'
+        echo ""
+        LAST=$(echo "$CLEAN" | tail -n1)
+        TOUP=$(echo "$LAST"  | grep -oE "to upload [0-9]+"  | grep -oE "[0-9]+")
+        UPING=$(echo "$LAST" | grep -oE "uploading [0-9]+"  | grep -oE "[0-9]+")
+        if [ "${TOUP:-0}" -eq 0 ] && [ "${UPING:-0}" -eq 0 ] 2>/dev/null; then
+            echo "    [!!] rclone reports NOTHING queued and NOTHING uploading,"
+            echo "         yet files on disk are still marked dirty."
+            echo ""
+            echo "         That means the writeback queue is empty - rclone is"
+            echo "         not retrying these files at all. Usually the mount"
+            echo "         was restarted before it re-queued them, or the files"
+            echo "         are held open by an application so writeback is"
+            echo "         deferred until the last handle closes."
+            echo ""
+            echo "         Fix: close anything using the mount, then restart:"
+            echo "           systemctl --user restart ${SERVICE_NAME}.service"
+        else
+            echo "    [OK] rclone has ${TOUP:-?} queued, ${UPING:-?} uploading right now."
+        fi
+    fi
+
+    echo ""
+    echo "--- Transfer stats lines (from --stats) ---"
+    ST=$(grep -E "Transferred:" "$LOG" 2>/dev/null | tail -n 5)
+    if [ -z "$ST" ]; then
+        echo "    (none - either --stats is not enabled on the RUNNING process,"
+        echo "     or nothing has transferred since it started)"
+        echo ""
+        echo "    Check the running process actually has it:"
+        echo "        tr '\\0' '\\n' < /proc/\$(pgrep -f 'rclone mount' | head -1)/cmdline | grep stats"
+    else
+        echo "$ST" | sed 's/^/    /'
+    fi
+
+    echo ""
+    echo "--- Last 20 vfs cache events ---"
+    VE=$(grep -iE "vfs cache" "$LOG" 2>/dev/null | grep -viE "vfs cache: cleaned:" | tail -n 20)
+    if [ -z "$VE" ]; then
+        echo "    (no vfs cache events logged)"
+    else
+        echo "$VE" | sed 's/^/    /'
+    fi
+
+    echo ""
+    echo "--- Last 15 lines of the log (anything at all) ---"
+    tail -n 15 "$LOG" | sed 's/^/    /'
+    echo ""
+}
+
 do_watch() {
     VFS_DIR="${CACHE_DIR}/vfs"
     VFS_META_DIR="${CACHE_DIR}/vfsMeta"
@@ -1060,6 +1140,9 @@ case "$1" in
         ;;
     watch)
         do_watch
+        ;;
+    logtail)
+        do_logtail
         ;;
     rescue-pending)
         shift

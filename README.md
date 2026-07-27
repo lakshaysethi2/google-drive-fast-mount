@@ -131,20 +131,62 @@ So streaming a single 30 GB file through a 5 GB cache can still use 30 GB while
 that file is held open. The limits govern *eviction of idle files*, not a hard
 ceiling during active use.
 
-### Genuine causes of a large cache
+### When the cache really is too big
 
-If `du -sh` really is large, the cause is usually one of these:
+If `du -sh ~/.cache/rclone/vfs` genuinely exceeds your `--vfs-cache-max-size`,
+run the diagnostic — it identifies which of the four causes applies:
 
-1. **Pending uploads.** Dirty (not-yet-uploaded) files are *never* evicted, by
-   design — evicting them would lose data. A stalled upload pins cache space
-   indefinitely. Check with:
+```bash
+./setup_gdrive_mount.sh diagnose
+```
+
+It reports the flags of the **running** process, then classifies every cached
+file as pending-upload, orphaned, or open:
+
+```text
+--- 1. Flags of the RUNNING rclone process ---
+    --vfs-cache-max-size         NOT SET  <-- unbounded!
+
+--- 3. Orphaned files (untracked, never counted or evicted) ---
+        20MB  gdrive/Movies/orphan1.mkv
+    2 orphan(s), 34MB invisible to the quota.
+
+  => Most of your cache is ORPHANED and invisible to rclone's quota.
+```
+
+The four real causes:
+
+1. **The running process doesn't have the limits.** Editing the unit file does
+   nothing until you `daemon-reload` *and* `restart`. A mount started before
+   you added `--vfs-cache-max-size` runs unbounded until restarted. Section 1
+   of the diagnostic shows what the live process is actually using — this is
+   the most common cause by far, and the easiest to miss.
+2. **Orphaned files.** Cache data whose `vfsMeta/` entry is missing is
+   **invisible to rclone's accounting** — `updateUsed()` sums only tracked
+   items, so orphans are never counted toward the quota and never evicted.
+   They accumulate from crashes, `kill -9`, or a previously unbounded mount,
+   and the cache grows without limit regardless of your settings.
+3. **Pending uploads.** Dirty files are *never* evicted by design — evicting
+   them would lose data. A stalled upload pins space indefinitely:
    ```bash
-   grep -iE "vfs cache: (queuing|starting upload|failed)" ~/.cache/rclone/rclone.log | tail
+   grep -iE "vfs cache: (failed|error)" ~/.cache/rclone/rclone.log | tail -20
    ```
-2. **A long-running process holding files open** (media server, indexer,
-   backup job). Open files can't be evicted.
-3. **A previously unbounded mount** that left orphaned files behind, or a crash
-   that stranded data in the cache directory.
+4. **Files held open** by a long-running reader (media server, indexer,
+   backup job) cannot be evicted while the handle is open.
+
+### Reclaiming space safely
+
+If the diagnostic reports orphans, purge just those — pending uploads are left
+untouched, so this cannot lose data:
+
+```bash
+systemctl --user stop rclone-gdrive.service
+./setup_gdrive_mount.sh purge-orphans
+systemctl --user start rclone-gdrive.service
+```
+
+It refuses to run while the mount is active, lists what it will delete, and
+asks before removing anything.
 
 ### Clearing the cache safely
 
@@ -201,6 +243,8 @@ to disk) at the cost of slower repeat reads and seeks.
 - **Disable Auto-Start**: `systemctl --user disable --now rclone-gdrive.service`
 - **View Logs**: `tail -f ~/.cache/rclone/rclone.log`
 - **Cache Usage**: `./setup_gdrive_mount.sh cache`
+- **Diagnose Cache Bloat**: `./setup_gdrive_mount.sh diagnose`
+- **Purge Orphans (data-safe)**: `./setup_gdrive_mount.sh purge-orphans`
 - **Clear Cache**: `./setup_gdrive_mount.sh clear-cache`
 
 Because the unit uses `Type=notify`, `systemctl --user status` also shows live

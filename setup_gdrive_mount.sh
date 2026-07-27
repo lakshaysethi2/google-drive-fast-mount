@@ -73,6 +73,163 @@ do_status() {
     fi
 }
 
+do_diagnose() {
+    VFS_DIR="${CACHE_DIR}/vfs"
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+
+    echo ""
+    echo "=========================================================="
+    echo "  VFS Cache Diagnosis"
+    echo "=========================================================="
+
+    if [ ! -d "$VFS_DIR" ]; then
+        echo "[i] No VFS cache directory at ${VFS_DIR}."
+        return 0
+    fi
+
+    REAL_KB=$(du -sk "$VFS_DIR" 2>/dev/null | cut -f1)
+    REAL_H=$(du -sh "$VFS_DIR" 2>/dev/null | cut -f1)
+    echo ""
+    echo "Real disk used: ${REAL_H}"
+
+    # ---------------------------------------------------------------
+    # 1. What flags is the RUNNING process actually using?
+    #    A unit file edited but never reloaded/restarted is the single
+    #    most common reason limits appear to be ignored.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 1. Flags of the RUNNING rclone process ---"
+    RCLONE_PID=$(pgrep -u "$(id -u)" -f "rclone mount" | head -n1)
+    if [ -z "$RCLONE_PID" ]; then
+        echo "  [!] No running 'rclone mount' process found for this user."
+        echo "      A stopped mount cannot evict anything, so the cache just sits there."
+    else
+        echo "  PID: ${RCLONE_PID}  (started: $(ps -o lstart= -p "$RCLONE_PID" 2>/dev/null | xargs))"
+        RUNNING_ARGS=$(tr '\0' '\n' < "/proc/${RCLONE_PID}/cmdline" 2>/dev/null | tr '\n' ' ')
+        for FLAG in --vfs-cache-max-size --vfs-cache-max-age --vfs-cache-min-free-space --vfs-cache-poll-interval --cache-dir; do
+            VAL=$(echo "$RUNNING_ARGS" | grep -oE -- "${FLAG}[= ][^ ]+" | head -n1 | awk '{print $2}')
+            if [ -n "$VAL" ]; then
+                printf '    %-28s %s\n' "$FLAG" "$VAL"
+            else
+                printf '    %-28s %s\n' "$FLAG" "NOT SET  <-- unbounded!"
+            fi
+        done
+        echo ""
+        echo "  If these differ from your unit file, the service was never restarted:"
+        echo "      systemctl --user daemon-reload && systemctl --user restart ${SERVICE_NAME}.service"
+    fi
+
+    # ---------------------------------------------------------------
+    # 2. Dirty items: pending upload. These are NEVER evicted, by
+    #    design, and deleting them loses data.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 2. Dirty items (pending upload, NEVER evicted) ---"
+    DIRTY_COUNT=0
+    DIRTY_BYTES=0
+    if [ -d "$VFS_META_DIR" ]; then
+        while IFS= read -r META; do
+            if grep -q '"Dirty": true' "$META" 2>/dev/null; then
+                REL="${META#"$VFS_META_DIR"/}"
+                DATA_FILE="${VFS_DIR}/${REL}"
+                if [ -f "$DATA_FILE" ]; then
+                    B=$(( $(stat -c %b "$DATA_FILE" 2>/dev/null || echo 0) * 512 ))
+                    DIRTY_BYTES=$((DIRTY_BYTES + B))
+                    if [ "$DIRTY_COUNT" -lt 15 ]; then
+                        printf '    %8s  %s\n' \
+                            "$(numfmt --to=iec --suffix=B "$B" 2>/dev/null || echo "$B")" "$REL"
+                    fi
+                fi
+                DIRTY_COUNT=$((DIRTY_COUNT + 1))
+            fi
+        done < <(find "$VFS_META_DIR" -type f 2>/dev/null)
+    fi
+    if [ "$DIRTY_COUNT" -eq 0 ]; then
+        echo "    None. Nothing is waiting to upload (safe to clear the cache)."
+    else
+        echo ""
+        echo "    ${DIRTY_COUNT} dirty file(s), $(numfmt --to=iec --suffix=B "$DIRTY_BYTES" 2>/dev/null || echo "$DIRTY_BYTES") pinned."
+        echo "    [!] DO NOT 'rm -rf' the cache - these have not reached Drive yet."
+        echo "        Check for upload errors:"
+        echo "          grep -iE 'vfs cache: (failed|error)' ${CACHE_DIR}/rclone.log | tail -20"
+    fi
+
+    # ---------------------------------------------------------------
+    # 3. Orphans: data files with no metadata. Rclone does not count
+    #    these toward the quota, so they are never evicted.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 3. Orphaned files (untracked, never counted or evicted) ---"
+    ORPHAN_COUNT=0
+    ORPHAN_BYTES=0
+    while IFS= read -r DATA_FILE; do
+        REL="${DATA_FILE#"$VFS_DIR"/}"
+        if [ ! -f "${VFS_META_DIR}/${REL}" ]; then
+            B=$(( $(stat -c %b "$DATA_FILE" 2>/dev/null || echo 0) * 512 ))
+            ORPHAN_BYTES=$((ORPHAN_BYTES + B))
+            if [ "$ORPHAN_COUNT" -lt 15 ]; then
+                printf '    %8s  %s\n' \
+                    "$(numfmt --to=iec --suffix=B "$B" 2>/dev/null || echo "$B")" "$REL"
+            fi
+            ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
+        fi
+    done < <(find "$VFS_DIR" -type f 2>/dev/null)
+    if [ "$ORPHAN_COUNT" -eq 0 ]; then
+        echo "    None. Every cached file has tracking metadata."
+    else
+        echo ""
+        echo "    ${ORPHAN_COUNT} orphan(s), $(numfmt --to=iec --suffix=B "$ORPHAN_BYTES" 2>/dev/null || echo "$ORPHAN_BYTES") invisible to the quota."
+        echo "    These are leftovers (crash, kill -9, or a previously unbounded mount)."
+        echo "    They have no pending data and are safe to delete while stopped."
+    fi
+
+    # ---------------------------------------------------------------
+    # 4. Currently open files - cannot be evicted while held.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 4. Cache files held open right now ---"
+    if [ -n "$RCLONE_PID" ] && [ -d "/proc/${RCLONE_PID}/fd" ]; then
+        OPEN_LIST=$(find "/proc/${RCLONE_PID}/fd" -type l 2>/dev/null \
+            | xargs -r readlink 2>/dev/null | grep "^${VFS_DIR}/" || true)
+        if [ -z "$OPEN_LIST" ]; then
+            echo "    None. Nothing is pinned by an open handle."
+        else
+            echo "$OPEN_LIST" | sort -u | head -n 15 | sed "s|^${VFS_DIR}/|    |"
+            echo "    (open files cannot be evicted until the reader closes them)"
+        fi
+    else
+        echo "    (cannot inspect - no running process)"
+    fi
+
+    # ---------------------------------------------------------------
+    # 5. Verdict
+    # ---------------------------------------------------------------
+    RECLAIM=$((ORPHAN_BYTES / 1024))
+    echo ""
+    echo "=========================================================="
+    echo "  Summary"
+    echo "=========================================================="
+    printf '  Real usage        : %s\n' "$REAL_H"
+    printf '  Pending upload    : %s (must keep)\n' \
+        "$(numfmt --to=iec --suffix=B "$DIRTY_BYTES" 2>/dev/null || echo "$DIRTY_BYTES")"
+    printf '  Orphaned          : %s (safe to reclaim)\n' \
+        "$(numfmt --to=iec --suffix=B "$ORPHAN_BYTES" 2>/dev/null || echo "$ORPHAN_BYTES")"
+    echo ""
+    if [ "$ORPHAN_COUNT" -gt 0 ] && [ "$RECLAIM" -gt $((REAL_KB / 2)) ]; then
+        echo "  => Most of your cache is ORPHANED and invisible to rclone's quota."
+        echo "     That is why the size limit never kicks in. Reclaim it with:"
+        echo "         ./setup_gdrive_mount.sh clear-cache"
+    elif [ "$DIRTY_COUNT" -gt 0 ] && [ "$DIRTY_BYTES" -gt $((REAL_KB * 1024 / 2)) ]; then
+        echo "  => Most of your cache is PENDING UPLOAD and cannot be evicted."
+        echo "     Fix the uploads (check the log above); do not delete the cache."
+    else
+        echo "  => No single dominant cause found above. The most likely"
+        echo "     explanation is the running process lacking the limits"
+        echo "     (see section 1) - restart the service to apply them."
+    fi
+    echo ""
+}
+
 do_cache() {
     echo ""
     echo "=== VFS Cache Usage ==="
@@ -117,6 +274,65 @@ do_cache() {
     else
         echo "    (no log file yet)"
     fi
+}
+
+do_purge_orphans() {
+    VFS_DIR="${CACHE_DIR}/vfs"
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+
+    echo ""
+    echo "=== Purge Orphaned Cache Files ==="
+    echo "Removes ONLY cache files with no tracking metadata. Files pending"
+    echo "upload are left untouched, so this cannot lose data."
+    echo ""
+
+    if [ ! -d "$VFS_DIR" ]; then
+        echo "[i] No VFS cache directory."
+        return 0
+    fi
+
+    if systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
+        echo "[!] The mount is running. Stop it first so rclone is not writing"
+        echo "    to these files while we delete them:"
+        echo "        systemctl --user stop ${SERVICE_NAME}.service"
+        return 1
+    fi
+
+    ORPHANS=$(mktemp)
+    TOTAL=0
+    COUNT=0
+    while IFS= read -r DATA_FILE; do
+        REL="${DATA_FILE#"$VFS_DIR"/}"
+        if [ ! -f "${VFS_META_DIR}/${REL}" ]; then
+            B=$(( $(stat -c %b "$DATA_FILE" 2>/dev/null || echo 0) * 512 ))
+            TOTAL=$((TOTAL + B))
+            COUNT=$((COUNT + 1))
+            printf '%s\n' "$DATA_FILE" >> "$ORPHANS"
+        fi
+    done < <(find "$VFS_DIR" -type f 2>/dev/null)
+
+    if [ "$COUNT" -eq 0 ]; then
+        echo "[i] No orphaned files found."
+        rm -f "$ORPHANS"
+        return 0
+    fi
+
+    echo "Found ${COUNT} orphaned file(s) totalling $(numfmt --to=iec --suffix=B "$TOTAL" 2>/dev/null || echo "$TOTAL"):"
+    head -n 10 "$ORPHANS" | sed "s|^${VFS_DIR}/|    |"
+    [ "$COUNT" -gt 10 ] && echo "    ... and $((COUNT - 10)) more"
+    echo ""
+    read -p "Delete these ${COUNT} file(s)? (y/N): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        rm -f "$ORPHANS"
+        return 0
+    fi
+
+    while IFS= read -r F; do rm -f "$F"; done < "$ORPHANS"
+    rm -f "$ORPHANS"
+    find "$VFS_DIR" -type d -empty -delete 2>/dev/null || true
+    echo "[✓] Reclaimed $(numfmt --to=iec --suffix=B "$TOTAL" 2>/dev/null || echo "$TOTAL")."
+    echo "    Cache is now: $(du -sh "$VFS_DIR" 2>/dev/null | cut -f1)"
 }
 
 do_clear_cache() {
@@ -332,6 +548,12 @@ case "$1" in
     cache)
         do_cache
         ;;
+    diagnose)
+        do_diagnose
+        ;;
+    purge-orphans)
+        do_purge_orphans
+        ;;
     clear-cache)
         do_clear_cache
         ;;
@@ -343,18 +565,22 @@ case "$1" in
         echo "2) Unmount Google Drive"
         echo "3) Check Mount Status & Logs"
         echo "4) Show VFS cache usage (real vs sparse)"
-        echo "5) Safely clear VFS cache"
-        echo "6) Exit"
+        echo "5) Diagnose why the cache is too big"
+        echo "6) Purge orphaned files only (data-safe)"
+        echo "7) Safely clear entire VFS cache"
+        echo "8) Exit"
         echo "=========================================="
-        read -p "Select an action [1-6]: " ACTION_CHOICE
+        read -p "Select an action [1-8]: " ACTION_CHOICE
 
         case "$ACTION_CHOICE" in
             1) do_setup ;;
             2) do_unmount ;;
             3) do_status ;;
             4) do_cache ;;
-            5) do_clear_cache ;;
-            6) echo "Exiting."; exit 0 ;;
+            5) do_diagnose ;;
+            6) do_purge_orphans ;;
+            7) do_clear_cache ;;
+            8) echo "Exiting."; exit 0 ;;
             *) echo "Invalid option."; exit 1 ;;
         esac
         ;;

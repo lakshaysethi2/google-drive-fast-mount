@@ -29,6 +29,11 @@ ExecStart=/usr/bin/rclone mount gdrive: %h/mnt/google_drive \
     --vfs-read-chunk-size 32M \
     --vfs-read-chunk-size-limit 1G \
     --buffer-size 32M \
+    --transfers 4 \
+    --drive-chunk-size 64M \
+    --drive-upload-cutoff 64M \
+    --drive-pacer-min-sleep 10ms \
+    --drive-pacer-burst 200 \
     --log-file %h/.cache/rclone/rclone.log \
     --log-level INFO
 ExecStop=/bin/fusermount -u -z %h/mnt/google_drive

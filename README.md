@@ -235,6 +235,69 @@ to disk) at the cost of slower repeat reads and seeks.
 
 ---
 
+## Upload Speed
+
+Downloads usually saturate a connection easily; uploads to Google Drive often
+do not. Check what is limiting yours:
+
+```bash
+./setup_gdrive_mount.sh speedcheck
+```
+
+### Is it safe to restart mid-upload?
+
+**Yes.** Stopping the service is a clean shutdown, not a data loss event:
+
+- `ExecStop` runs `fusermount -u`, which flushes the VFS writeback queue.
+- Anything that doesn't finish stays in the cache marked dirty, and rclone
+  **resumes it automatically** on the next start. Nothing is dropped.
+- Partial chunked uploads are restarted from the beginning of the file, so you
+  lose in-flight progress on the current file, not the file itself.
+
+The one thing you must never do is `rm -rf` the cache while files are pending.
+Stopping the service is fine; deleting their only copy is not.
+
+### The three real causes of slow uploads
+
+**1. No personal `client_id` — usually the biggest factor.** By default rclone
+uses a single OAuth client shared by every rclone user worldwide, and Google
+rate-limits *per client*. You are queueing behind everyone else's traffic.
+Creating your own is free and takes about ten minutes; it does not affect your
+files or require re-uploading anything:
+[Making your own client_id](https://rclone.org/drive/#making-your-own-client-id).
+
+**2. `--drive-chunk-size` too small.** rclone's default is 8M. Each chunk is a
+separate HTTP request, and the connection sits idle during each round trip. On
+a link with any latency this caps throughput well below the line rate,
+regardless of bandwidth. Raising it to 64M means fewer, larger requests.
+
+**3. Per-stream throttling.** Google throttles each upload *stream*, so one
+transfer rarely saturates a fast connection no matter how it's tuned. Several
+parallel transfers beat one.
+
+### Tuning
+
+The defaults now applied are `--drive-chunk-size 64M`, `--transfers 4`, and
+`--drive-pacer-min-sleep 10ms`. Override them:
+
+```bash
+DRIVE_CHUNK_SIZE=128M TRANSFERS=8 ./setup_gdrive_mount.sh setup
+```
+
+> [!IMPORTANT]
+> **RAM cost is `--drive-chunk-size` × `--transfers`**, because each chunk is
+> buffered in memory. `64M × 4` = 256 MB. Don't set `1G × 8` on a small
+> machine — rclone will be OOM-killed mid-upload.
+
+Raising `--transfers` past ~8 is usually counterproductive: Google starts
+rate-limiting and everything slows down. If `speedcheck` reports rate-limit
+responses, a personal `client_id` is the fix — more parallelism is not.
+
+Also note Drive's ~750 GB/day upload cap. Exceeding it produces *errors*, not
+slowness; `./setup_gdrive_mount.sh uploads` will identify that case.
+
+---
+
 ## Service Management & Unmounting
 
 - **Check Status**: `systemctl --user status rclone-gdrive.service`
@@ -244,6 +307,9 @@ to disk) at the cost of slower repeat reads and seeks.
 - **View Logs**: `tail -f ~/.cache/rclone/rclone.log`
 - **Cache Usage**: `./setup_gdrive_mount.sh cache`
 - **Diagnose Cache Bloat**: `./setup_gdrive_mount.sh diagnose`
+- **Pending Uploads / Failures**: `./setup_gdrive_mount.sh uploads`
+- **Upload Speed Check**: `./setup_gdrive_mount.sh speedcheck`
+- **Rescue Pending Data**: `./setup_gdrive_mount.sh rescue-pending <dir>`
 - **Purge Orphans (data-safe)**: `./setup_gdrive_mount.sh purge-orphans`
 - **Clear Cache**: `./setup_gdrive_mount.sh clear-cache`
 

@@ -13,6 +13,7 @@ CACHE_DIR="${HOME}/.cache/rclone"
 RCLONE_CONF_DIR="${HOME}/.config/rclone"
 RCLONE_CONF="${RCLONE_CONF_DIR}/rclone.conf"
 READ_ONLY=false
+FORCE_CLEAR=false
 
 # --- VFS cache tuning (override via environment before running the script) ---
 # VFS_CACHE_MAX_SIZE      Hard-ish cap on cached file data (soft: see README).
@@ -23,6 +24,19 @@ VFS_CACHE_MAX_SIZE="${VFS_CACHE_MAX_SIZE:-5G}"
 VFS_CACHE_MAX_AGE="${VFS_CACHE_MAX_AGE:-1h}"
 VFS_CACHE_MIN_FREE="${VFS_CACHE_MIN_FREE:-5G}"
 VFS_CACHE_POLL_INTERVAL="${VFS_CACHE_POLL_INTERVAL:-1m}"
+
+# --- Upload throughput tuning ---
+# DRIVE_CHUNK_SIZE  Upload chunk size. rclone's default is 8M, which stalls on
+#                   high-latency links: each chunk is a separate HTTP request
+#                   and the connection idles during the round trip. Larger
+#                   chunks keep the pipe full. Costs RAM: chunk x transfers.
+# TRANSFERS         Parallel uploads. Drive throttles per-stream, so a few
+#                   concurrent transfers beat one fast one.
+# DRIVE_PACER_MIN_SLEEP  Delay between API calls (rclone default 100ms).
+DRIVE_CHUNK_SIZE="${DRIVE_CHUNK_SIZE:-64M}"
+TRANSFERS="${TRANSFERS:-4}"
+DRIVE_PACER_MIN_SLEEP="${DRIVE_PACER_MIN_SLEEP:-10ms}"
+DRIVE_PACER_BURST="${DRIVE_PACER_BURST:-200}"
 
 do_unmount() {
     echo ""
@@ -70,6 +84,285 @@ do_status() {
         echo "[✓] Mount point '${MOUNT_DIR}' is ACTIVE."
     else
         echo "[!] Mount point '${MOUNT_DIR}' is NOT mounted."
+    fi
+}
+
+do_speedcheck() {
+    echo ""
+    echo "=========================================================="
+    echo "  Upload Throughput Check"
+    echo "=========================================================="
+
+    # ---------------------------------------------------------------
+    # 1. Own client_id. Without one you share rclone's global OAuth
+    #    client with every other rclone user, and Google's per-client
+    #    rate limiting is what throttles you.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 1. OAuth client_id ---"
+    if [ -f "$RCLONE_CONF" ] && \
+       awk -v r="[${REMOTE_NAME}]" '$0==r{f=1;next} /^\[/{f=0} f' "$RCLONE_CONF" | grep -q "^client_id *= *[^ ]"; then
+        echo "  [OK] Using your own client_id."
+    else
+        echo "  [!!] NO client_id - THIS IS USUALLY THE #1 CAUSE OF SLOW UPLOADS."
+        echo ""
+        echo "       You are sharing rclone's global OAuth client with every"
+        echo "       other rclone user on the planet. Google rate-limits per"
+        echo "       client, so you inherit everyone else's traffic."
+        echo ""
+        echo "       Creating your own is free and takes ~10 minutes:"
+        echo "         https://rclone.org/drive/#making-your-own-client-id"
+        echo "       Then: rclone config  ->  edit '${REMOTE_NAME}'  ->  set client_id/secret"
+        echo "       Your existing files and token are unaffected."
+    fi
+
+    # ---------------------------------------------------------------
+    # 2. Effective upload flags on the running process.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 2. Upload flags in effect ---"
+    RCLONE_PID=$(pgrep -u "$(id -u)" -f "rclone mount" | head -n1)
+    if [ -z "$RCLONE_PID" ]; then
+        echo "  (no running mount)"
+    else
+        ARGS=$(tr '\0' ' ' < "/proc/${RCLONE_PID}/cmdline" 2>/dev/null)
+        for F in --drive-chunk-size --drive-upload-cutoff --transfers --drive-pacer-min-sleep --bwlimit; do
+            V=$(echo "$ARGS" | grep -oE -- "${F}[= ][^ ]+" | head -n1 | awk '{print $2}')
+            if [ -n "$V" ]; then
+                printf '    %-26s %s\n' "$F" "$V"
+            else
+                case "$F" in
+                    --drive-chunk-size)     printf '    %-26s %s\n' "$F" "8M (default)  <-- too small, see below" ;;
+                    --drive-upload-cutoff)  printf '    %-26s %s\n' "$F" "8M (default)" ;;
+                    --transfers)            printf '    %-26s %s\n' "$F" "4 (default)" ;;
+                    --drive-pacer-min-sleep) printf '    %-26s %s\n' "$F" "100ms (default)" ;;
+                    --bwlimit)              printf '    %-26s %s\n' "$F" "unset (no cap - good)" ;;
+                esac
+            fi
+        done
+
+        if echo "$ARGS" | grep -q -- "--bwlimit"; then
+            echo ""
+            echo "  [!!] --bwlimit is set. This caps your speed directly."
+        fi
+    fi
+
+    # ---------------------------------------------------------------
+    # 3. Measured throughput from the log.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 3. Recent measured upload speed ---"
+    LOG="${CACHE_DIR}/rclone.log"
+    if [ -f "$LOG" ]; then
+        SPEEDS=$(grep -oE "[0-9.]+ [KMG]i?Bytes/s" "$LOG" 2>/dev/null | tail -n 5)
+        if [ -n "$SPEEDS" ]; then
+            echo "$SPEEDS" | sed 's/^/    /'
+        else
+            echo "    (no transfer stats in log; add --stats 30s to see them)"
+        fi
+        RL=$(grep -ciE "rateLimitExceeded|userRateLimitExceeded|429" "$LOG" 2>/dev/null || echo 0)
+        echo ""
+        echo "    Rate-limit responses in log: ${RL}"
+        if [ "$RL" -gt 0 ] 2>/dev/null; then
+            echo "    [!] Google is actively throttling you. An own client_id"
+            echo "        (section 1) is the fix; raising --transfers will not help."
+        fi
+    else
+        echo "    (no log file)"
+    fi
+
+    # ---------------------------------------------------------------
+    # 4. Guidance
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- 4. What actually moves the needle ---"
+    echo "  Google Drive throttles each upload STREAM, so a single transfer"
+    echo "  rarely saturates a fast line no matter how it is tuned. Throughput"
+    echo "  comes from parallelism plus large chunks:"
+    echo ""
+    echo "    --drive-chunk-size 64M   bigger HTTP requests, fewer round trips"
+    echo "    --transfers 4            parallel streams (total = chunk x transfers RAM)"
+    echo "    --drive-pacer-min-sleep 10ms   less idle time between API calls"
+    echo ""
+    echo "  Apply by re-running setup (values are overridable):"
+    echo "      DRIVE_CHUNK_SIZE=64M TRANSFERS=4 ./setup_gdrive_mount.sh setup"
+    echo ""
+    echo "  RAM cost: --drive-chunk-size x --transfers is buffered in memory."
+    echo "  64M x 4 = 256MB. Do not set 1G x 8 on a small machine."
+    echo ""
+    echo "  Note: Drive's ~750GB/day upload cap is separate. Hitting it causes"
+    echo "  errors, not slowness - check with: ./setup_gdrive_mount.sh uploads"
+    echo ""
+}
+
+do_uploads() {
+    LOG="${CACHE_DIR}/rclone.log"
+
+    echo ""
+    echo "=========================================================="
+    echo "  Pending Upload Analysis"
+    echo "=========================================================="
+
+    # Live queue via the rc interface, if the mount was started with --rc.
+    echo ""
+    echo "--- Live upload queue ---"
+    if command -v rclone &> /dev/null && rclone rc vfs/queue --json 2>/dev/null | head -c 1 | grep -q .; then
+        rclone rc vfs/queue 2>/dev/null | head -n 40
+    else
+        echo "  (rclone rc unavailable - mount not started with --rc. Using log instead.)"
+    fi
+
+    if [ ! -f "$LOG" ]; then
+        echo ""
+        echo "[!] No log file at ${LOG}"
+        return 0
+    fi
+
+    # ---------------------------------------------------------------
+    # Distinct upload errors, most recent first. This is the payload:
+    # the actual reason Drive is rejecting the writes.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- Recent upload failures ---"
+    FAILS=$(grep -iE "vfs cache: failed to (upload|transfer)|failed to copy|Post \"https" "$LOG" 2>/dev/null | tail -n 200)
+    if [ -z "$FAILS" ]; then
+        echo "  No upload failures logged."
+        echo "  If files are still pending, uploads may simply be slow or queued"
+        echo "  behind --transfers. Watch progress with:"
+        echo "      tail -f ${LOG} | grep -i 'vfs cache'"
+    else
+        echo "$FAILS" | tail -n 8 | sed 's/^/    /'
+        echo ""
+        echo "  Most common error signatures found:"
+        echo "$FAILS" \
+            | grep -oiE "storageQuotaExceeded|quotaExceeded|userRateLimitExceeded|rateLimitExceeded|teamDriveFileLimitExceeded|invalid_grant|token expired|401|403|404|500|502|503|couldn't fetch token|no space left|permission denied|context deadline exceeded|connection reset" \
+            | sort | uniq -c | sort -rn | head -n 8 | sed 's/^/    /'
+    fi
+
+    # ---------------------------------------------------------------
+    # Map the signature to a cause + fix. Infinite retry means a
+    # permanent error will never clear on its own.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- Diagnosis ---"
+    MATCHED=0
+
+    if echo "$FAILS" | grep -qi "storageQuotaExceeded"; then
+        MATCHED=1
+        echo "  [X] GOOGLE DRIVE IS FULL (storageQuotaExceeded)."
+        echo "      This is permanent - rclone retries forever but can never"
+        echo "      succeed. Free space in Drive (or buy more), then restart"
+        echo "      the mount. Uploads resume automatically."
+        echo "      Check usage:  rclone about gdrive:"
+    fi
+
+    if echo "$FAILS" | grep -qiE "userRateLimitExceeded|rateLimitExceeded"; then
+        MATCHED=1
+        echo "  [!] RATE / QUOTA LIMIT HIT."
+        echo "      Google Drive caps uploads at ~750GB/day per account. Once"
+        echo "      tripped it clears after ~24h. Reduce concurrency so the"
+        echo "      backlog drains without re-tripping it:"
+        echo "          --transfers 2 --tpslimit 8 --drive-pacer-min-sleep 100ms"
+    fi
+
+    if echo "$FAILS" | grep -qiE "invalid_grant|token expired|couldn't fetch token|401"; then
+        MATCHED=1
+        echo "  [X] OAUTH TOKEN EXPIRED OR REVOKED."
+        echo "      Every upload will keep failing until you re-authorise:"
+        echo "          rclone config reconnect ${REMOTE_NAME}:"
+        echo "      Then restart the mount. Do NOT delete the cache first."
+    fi
+
+    # Only report a bare 403 if a more specific 403 cause (quota/rate) didn't
+    # already match, otherwise it is just noise.
+    if echo "$FAILS" | grep -qiE "403|permission denied" \
+       && ! echo "$FAILS" | grep -qiE "storageQuotaExceeded|userRateLimitExceeded|rateLimitExceeded"; then
+        MATCHED=1
+        echo "  [!] PERMISSION DENIED (403)."
+        echo "      The account may lack write access to the target folder,"
+        echo "      or the file is owned by someone else. Verify with:"
+        echo "          rclone lsd ${REMOTE_NAME}:"
+    fi
+
+    if echo "$FAILS" | grep -qi "no space left"; then
+        MATCHED=1
+        echo "  [X] LOCAL DISK FULL."
+        echo "      rclone cannot stage uploads with a full disk, so the queue"
+        echo "      is deadlocked. Free local space first - see 'Rescue' below."
+    fi
+
+    if [ "$MATCHED" -eq 0 ] && [ -n "$FAILS" ]; then
+        echo "  Errors present but unrecognised. Full context:"
+        echo "      grep -i 'vfs cache' ${LOG} | tail -50"
+    fi
+
+    # ---------------------------------------------------------------
+    # Always tell the user how to protect the data.
+    # ---------------------------------------------------------------
+    echo ""
+    echo "--- Protecting the pending data ---"
+    echo "  These 35GB-style backlogs exist ONLY in the cache. Before any"
+    echo "  troubleshooting that risks the cache, copy them somewhere safe:"
+    echo "      ./setup_gdrive_mount.sh rescue-pending /path/to/backup"
+    echo ""
+    echo "  rclone retries failed uploads forever (5 min max backoff), so a"
+    echo "  permanent error like a full Drive will never resolve by waiting."
+    echo ""
+}
+
+do_rescue_pending() {
+    DEST="$1"
+    VFS_DIR="${CACHE_DIR}/vfs"
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+
+    echo ""
+    echo "=== Rescue Pending Uploads ==="
+
+    if [ -z "$DEST" ]; then
+        echo "Copies every not-yet-uploaded file out of the cache to a normal"
+        echo "directory, so the data survives regardless of what happens next."
+        echo ""
+        echo "Usage: ./setup_gdrive_mount.sh rescue-pending /path/to/backup"
+        return 1
+    fi
+
+    if [ ! -d "$VFS_META_DIR" ]; then
+        echo "[i] No cache metadata directory; nothing pending."
+        return 0
+    fi
+
+    mkdir -p "$DEST" || { echo "[!] Cannot create ${DEST}"; return 1; }
+
+    COUNT=0
+    BYTES=0
+    while IFS= read -r META; do
+        grep -q '"Dirty": true' "$META" 2>/dev/null || continue
+        REL="${META#"$VFS_META_DIR"/}"
+        SRC="${VFS_DIR}/${REL}"
+        [ -f "$SRC" ] || continue
+        mkdir -p "${DEST}/$(dirname "$REL")"
+        # --sparse keeps holes; dirty files are normally fully written anyway.
+        if cp --sparse=always --preserve=timestamps "$SRC" "${DEST}/${REL}" 2>/dev/null; then
+            B=$(( $(stat -c %b "$SRC" 2>/dev/null || echo 0) * 512 ))
+            BYTES=$((BYTES + B))
+            COUNT=$((COUNT + 1))
+            printf '    %8s  %s\n' \
+                "$(numfmt --to=iec --suffix=B "$B" 2>/dev/null || echo "$B")" "$REL"
+        else
+            echo "    [!] FAILED to copy ${REL}"
+        fi
+    done < <(find "$VFS_META_DIR" -type f 2>/dev/null)
+
+    echo ""
+    if [ "$COUNT" -eq 0 ]; then
+        echo "[i] No pending files found - everything has uploaded."
+    else
+        echo "[✓] Rescued ${COUNT} file(s), $(numfmt --to=iec --suffix=B "$BYTES" 2>/dev/null || echo "$BYTES") to ${DEST}"
+        echo ""
+        echo "    Verify the copies look right, then you can re-upload later with:"
+        echo "        rclone copy ${DEST} ${REMOTE_NAME}:/ --progress"
+        echo ""
+        echo "    Keep this backup until the files are confirmed on Drive."
     fi
 }
 
@@ -342,6 +635,52 @@ do_clear_cache() {
     echo "    Deleting it while those are pending means DATA LOSS."
     echo ""
 
+    # Hard stop if anything is still pending upload. Counting dirty items is
+    # cheap and prevents the single most destructive mistake available here.
+    VFS_META_DIR="${CACHE_DIR}/vfsMeta"
+    DIRTY_N=0
+    DIRTY_B=0
+    if [ -d "$VFS_META_DIR" ]; then
+        while IFS= read -r META; do
+            if grep -q '"Dirty": true' "$META" 2>/dev/null; then
+                REL="${META#"$VFS_META_DIR"/}"
+                SRC="${CACHE_DIR}/vfs/${REL}"
+                if [ -f "$SRC" ]; then
+                    DIRTY_B=$((DIRTY_B + $(( $(stat -c %b "$SRC" 2>/dev/null || echo 0) * 512 )) ))
+                fi
+                DIRTY_N=$((DIRTY_N + 1))
+            fi
+        done < <(find "$VFS_META_DIR" -type f 2>/dev/null)
+    fi
+
+    if [ "$DIRTY_N" -gt 0 ]; then
+        echo "  ######################################################"
+        echo "  #  REFUSING TO CLEAR - DATA WOULD BE LOST            #"
+        echo "  ######################################################"
+        echo ""
+        echo "  ${DIRTY_N} file(s) totalling $(numfmt --to=iec --suffix=B "$DIRTY_B" 2>/dev/null || echo "$DIRTY_B") have NOT reached Google Drive."
+        echo "  They exist ONLY here. Deleting the cache destroys them."
+        echo ""
+        echo "  Do this instead:"
+        echo "    1. Find out why uploads are failing:"
+        echo "         ./setup_gdrive_mount.sh uploads"
+        echo "    2. Copy the pending data somewhere safe:"
+        echo "         ./setup_gdrive_mount.sh rescue-pending ~/drive-backup"
+        echo "    3. Only then, if you still want to wipe the cache, re-run"
+        echo "       this command with the override:"
+        echo "         ./setup_gdrive_mount.sh clear-cache --force"
+        echo ""
+        if [ "$FORCE_CLEAR" != true ]; then
+            return 1
+        fi
+        echo "  [!] --force given: proceeding despite ${DIRTY_N} pending file(s)."
+        read -p "  Type DELETE to confirm permanent loss: " FORCE_CONFIRM
+        if [ "$FORCE_CONFIRM" != "DELETE" ]; then
+            echo "  Cancelled."
+            return 1
+        fi
+    fi
+
     if systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
         echo "[i] Service is running. Asking rclone to flush pending uploads first..."
         echo "    (stopping the service triggers a clean unmount + writeback)"
@@ -498,6 +837,11 @@ ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --vfs-read-chunk-size 32M \\
     --vfs-read-chunk-size-limit 1G \\
     --buffer-size 32M \\
+    --transfers ${TRANSFERS} \\
+    --drive-chunk-size ${DRIVE_CHUNK_SIZE} \\
+    --drive-upload-cutoff ${DRIVE_CHUNK_SIZE} \\
+    --drive-pacer-min-sleep ${DRIVE_PACER_MIN_SLEEP} \\
+    --drive-pacer-burst ${DRIVE_PACER_BURST} \\
     --log-file ${CACHE_DIR}/rclone.log \\
     --log-level INFO${MOUNT_FLAGS}
 ExecStop=/bin/fusermount -u -z ${MOUNT_DIR}
@@ -554,7 +898,24 @@ case "$1" in
     purge-orphans)
         do_purge_orphans
         ;;
+    uploads)
+        do_uploads
+        ;;
+    speedcheck)
+        do_speedcheck
+        ;;
+    rescue-pending)
+        shift
+        do_rescue_pending "$1"
+        ;;
     clear-cache)
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --force) FORCE_CLEAR=true; shift ;;
+                *) shift ;;
+            esac
+        done
         do_clear_cache
         ;;
     *)
@@ -566,11 +927,13 @@ case "$1" in
         echo "3) Check Mount Status & Logs"
         echo "4) Show VFS cache usage (real vs sparse)"
         echo "5) Diagnose why the cache is too big"
-        echo "6) Purge orphaned files only (data-safe)"
-        echo "7) Safely clear entire VFS cache"
-        echo "8) Exit"
+        echo "6) Analyse pending uploads / failures"
+        echo "7) Check upload speed & throttling"
+        echo "8) Purge orphaned files only (data-safe)"
+        echo "9) Safely clear entire VFS cache"
+        echo "10) Exit"
         echo "=========================================="
-        read -p "Select an action [1-8]: " ACTION_CHOICE
+        read -p "Select an action [1-10]: " ACTION_CHOICE
 
         case "$ACTION_CHOICE" in
             1) do_setup ;;
@@ -578,9 +941,11 @@ case "$1" in
             3) do_status ;;
             4) do_cache ;;
             5) do_diagnose ;;
-            6) do_purge_orphans ;;
-            7) do_clear_cache ;;
-            8) echo "Exiting."; exit 0 ;;
+            6) do_uploads ;;
+            7) do_speedcheck ;;
+            8) do_purge_orphans ;;
+            9) do_clear_cache ;;
+            10) echo "Exiting."; exit 0 ;;
             *) echo "Invalid option."; exit 1 ;;
         esac
         ;;

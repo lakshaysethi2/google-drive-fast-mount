@@ -161,24 +161,51 @@ do_reupload() {
 
     OKN=0
     FAILN=0
+    FAILED_LIST=()
     while IFS=$'\t' read -r SRC DEST_PATH; do
         DEST_DIR=$(dirname "$DEST_PATH")
         [ "$DEST_DIR" = "." ] && DEST_DIR=""
         echo "  -> ${DEST_PATH}"
-        if rclone copyto "$SRC" "${REMOTE_NAME}:${DEST_PATH}" \
+        # NB: piping to sed would mask rclone's exit status (the pipeline
+        # returns sed's status), silently counting failed uploads as
+        # successes and inviting a destructive clear-cache afterwards.
+        # Capture output, then test rclone's own status.
+        # `|| CP_RC=$?` keeps `set -e` from aborting the whole run on the
+        # first failed file; we want to attempt every file and report.
+        CP_RC=0
+        CP_OUT=$(rclone copyto "$SRC" "${REMOTE_NAME}:${DEST_PATH}" \
               --config "$RCLONE_CONF" \
               --drive-chunk-size "$DRIVE_CHUNK_SIZE" \
-              --transfers 1 --stats 10s --stats-one-line 2>&1 | sed 's/^/     /'; then
+              --transfers 1 --stats 10s --stats-one-line 2>&1) || CP_RC=$?
+        [ -n "$CP_OUT" ] && printf '%s\n' "$CP_OUT" | sed 's/^/     /'
+        if [ "$CP_RC" -eq 0 ]; then
             OKN=$((OKN + 1))
         else
             FAILN=$((FAILN + 1))
-            echo "     [!] failed"
+            FAILED_LIST+=("$DEST_PATH")
+            echo "     [!] FAILED (rclone exit ${CP_RC})"
         fi
     done < "$LIST"
     rm -f "$LIST"
 
     echo ""
-    echo "[✓] Uploaded ${OKN}, failed ${FAILN}."
+    if [ "$FAILN" -gt 0 ]; then
+        echo "  ######################################################"
+        echo "  #  ${FAILN} UPLOAD(S) FAILED - DO NOT CLEAR THE CACHE      "
+        echo "  ######################################################"
+        echo ""
+        echo "  Uploaded ${OKN}, FAILED ${FAILN}."
+        echo ""
+        echo "  These files did NOT reach Drive and exist only in the cache:"
+        printf '    %s\n' "${FAILED_LIST[@]}" | head -n 20
+        [ "${#FAILED_LIST[@]}" -gt 20 ] && echo "    ... and $((${#FAILED_LIST[@]} - 20)) more"
+        echo ""
+        echo "  Diagnose before retrying:  ./setup_gdrive_mount.sh uploads"
+        echo "  Back them up:              ./setup_gdrive_mount.sh rescue-pending ~/drive-backup"
+        return 1
+    fi
+
+    echo "[✓] Uploaded ${OKN}, failed 0."
     echo ""
     echo "    Verify a few on Drive, then clear the stale cache entries:"
     echo "        systemctl --user stop ${SERVICE_NAME}.service"
@@ -221,9 +248,18 @@ do_logtail() {
         LAST=$(echo "$CLEAN" | tail -n1)
         TOUP=$(echo "$LAST"  | grep -oE "to upload [0-9]+"  | grep -oE "[0-9]+")
         UPING=$(echo "$LAST" | grep -oE "uploading [0-9]+"  | grep -oE "[0-9]+")
-        if [ "${TOUP:-0}" -eq 0 ] && [ "${UPING:-0}" -eq 0 ] 2>/dev/null; then
+        # Actually count dirty files rather than asserting they exist: an
+        # idle queue is entirely normal when nothing is pending.
+        DIRTY_ON_DISK=0
+        if [ -d "${CACHE_DIR}/vfsMeta" ]; then
+            while IFS= read -r M; do
+                grep -q '"Dirty": true' "$M" 2>/dev/null && DIRTY_ON_DISK=$((DIRTY_ON_DISK + 1))
+            done < <(find "${CACHE_DIR}/vfsMeta" -type f 2>/dev/null)
+        fi
+
+        if [ "${TOUP:-0}" -eq 0 ] && [ "${UPING:-0}" -eq 0 ] && [ "$DIRTY_ON_DISK" -gt 0 ] 2>/dev/null; then
             echo "    [!!] rclone reports NOTHING queued and NOTHING uploading,"
-            echo "         yet files on disk are still marked dirty."
+            echo "         yet ${DIRTY_ON_DISK} file(s) on disk are still marked dirty."
             echo ""
             echo "         That means the writeback queue is empty - rclone is"
             echo "         not retrying these files at all. Usually the mount"
@@ -233,6 +269,10 @@ do_logtail() {
             echo ""
             echo "         Fix: close anything using the mount, then restart:"
             echo "           systemctl --user restart ${SERVICE_NAME}.service"
+            echo "         If that does not re-queue them, upload directly:"
+            echo "           ./setup_gdrive_mount.sh reupload --dry-run"
+        elif [ "${TOUP:-0}" -eq 0 ] && [ "${UPING:-0}" -eq 0 ]; then
+            echo "    [OK] Queue is empty and no files are dirty - nothing pending."
         else
             echo "    [OK] rclone has ${TOUP:-?} queued, ${UPING:-?} uploading right now."
         fi
@@ -240,7 +280,10 @@ do_logtail() {
 
     echo ""
     echo "--- Transfer stats lines (from --stats) ---"
-    ST=$(grep -E "Transferred:" "$LOG" 2>/dev/null | tail -n 5)
+    # Match both stats formats: "Transferred: ..." (multi-line) and the
+    # bare "1.2 GiB / 33 GiB, 3%, ..." emitted by --stats-one-line, which
+    # this unit enables.
+    ST=$(grep -E "Transferred:|[0-9.]+ *[KMGT]?i?B? */ +[0-9.]+ *[KMGT]?i?B" "$LOG" 2>/dev/null | tail -n 5)
     if [ -z "$ST" ]; then
         echo "    (none - either --stats is not enabled on the RUNNING process,"
         echo "     or nothing has transferred since it started)"
@@ -333,6 +376,7 @@ do_watch() {
     PREV_T=$START_T
     START_SENT=$(_sent)
     PREV_SENT=$START_SENT
+    LAST_PROGRESS_T=$START_T
 
     while true; do
         sleep 30
@@ -348,6 +392,7 @@ do_watch() {
         # Prefer live wire throughput when rclone is reporting it: it shows
         # progress within a file, not just on completion.
         WIRE=0
+        DSENT=0
         if [ -n "$SENT" ] && [ -n "$PREV_SENT" ] && [ "$DT" -gt 0 ]; then
             DSENT=$((SENT - PREV_SENT))
             [ "$DSENT" -gt 0 ] && WIRE=$((DSENT / DT))
@@ -387,17 +432,21 @@ do_watch() {
             return 0
         fi
 
-        # Only call it stalled if NOTHING moved: no file completed AND no
-        # bytes went over the wire. A large file uploading for 20 minutes
-        # completes nothing but is perfectly healthy.
-        TOT_SENT=0
-        if [ -n "$SENT" ] && [ -n "$START_SENT" ]; then
-            TOT_SENT=$((SENT - START_SENT))
+        # Stall detection is based on time since the last OBSERVED progress,
+        # not on cumulative totals from the start. Totals break when the log
+        # only appears partway through (fresh mount): the baseline is empty,
+        # so the delta stays 0 forever and a healthy upload is reported as
+        # stalled. Any completion or any wire movement resets the clock.
+        if [ "$DB" -gt 0 ] || [ "${DSENT:-0}" -gt 0 ]; then
+            LAST_PROGRESS_T=$NOW
         fi
-        if [ "$TOT_DT" -ge 900 ] && [ "$TOT_DB" -le 0 ] && [ "$TOT_SENT" -le 0 ]; then
+        STALL_FOR=$((NOW - LAST_PROGRESS_T))
+        if [ "$STALL_FOR" -ge 900 ]; then
             echo ""
-            echo "[!] No files completed and no bytes sent in $((TOT_DT / 60)) minutes."
+            echo "[!] No files completed and no bytes sent in $((STALL_FOR / 60)) minutes."
             echo "    Diagnose with: ./setup_gdrive_mount.sh uploads"
+            echo "    If rclone reports 'to upload 0', its queue is empty:"
+            echo "        ./setup_gdrive_mount.sh logtail"
             return 1
         fi
 
@@ -447,7 +496,10 @@ do_speedcheck() {
     else
         ARGS=$(tr '\0' ' ' < "/proc/${RCLONE_PID}/cmdline" 2>/dev/null)
         for F in --drive-chunk-size --drive-upload-cutoff --transfers --drive-pacer-min-sleep --bwlimit; do
-            V=$(echo "$ARGS" | grep -oE -- "${F}[= ][^ ]+" | head -n1 | awk '{print $2}')
+            # Handle both "--flag value" and "--flag=value"; stripping the
+            # flag and any =/space separator covers both without awk column
+            # assumptions (which silently miss the = form).
+            V=$(echo "$ARGS" | grep -oE -- "${F}[= ][^ ]+" | head -n1 | sed -E "s|^${F}[= ]||")
             if [ -n "$V" ]; then
                 printf '    %-26s %s\n' "$F" "$V"
             else
@@ -474,13 +526,18 @@ do_speedcheck() {
     echo "--- 3. Recent measured upload speed ---"
     LOG="${CACHE_DIR}/rclone.log"
     if [ -f "$LOG" ]; then
-        SPEEDS=$(grep -oE "[0-9.]+ [KMG]i?Bytes/s" "$LOG" 2>/dev/null | tail -n 5)
+        # Modern rclone prints "12.345 MiB/s"; older builds used "MBytes/s".
+        # Match both, and skip the all-zero lines an idle mount emits.
+        SPEEDS=$(grep -oE "[0-9.]+ *[KMGT]?i?B(ytes)?/s" "$LOG" 2>/dev/null \
+                 | grep -vE "^0 *B(ytes)?/s$" | tail -n 5)
         if [ -n "$SPEEDS" ]; then
             echo "$SPEEDS" | sed 's/^/    /'
         else
             echo "    (no transfer stats in log; add --stats 30s to see them)"
         fi
-        RL=$(grep -ciE "rateLimitExceeded|userRateLimitExceeded|429" "$LOG" 2>/dev/null || echo 0)
+        # grep -c exits 1 on zero matches; `|| echo 0` would then append a
+        # second line, making RL multi-line and breaking the -gt test.
+        RL=$(grep -ciE "rateLimitExceeded|userRateLimitExceeded|429" "$LOG" 2>/dev/null) || RL=0
         echo ""
         echo "    Rate-limit responses in log: ${RL}"
         if [ "$RL" -gt 0 ] 2>/dev/null; then
@@ -737,7 +794,8 @@ do_diagnose() {
         echo "  PID: ${RCLONE_PID}  (started: $(ps -o lstart= -p "$RCLONE_PID" 2>/dev/null | xargs))"
         RUNNING_ARGS=$(tr '\0' '\n' < "/proc/${RCLONE_PID}/cmdline" 2>/dev/null | tr '\n' ' ')
         for FLAG in --vfs-cache-max-size --vfs-cache-max-age --vfs-cache-min-free-space --vfs-cache-poll-interval --cache-dir; do
-            VAL=$(echo "$RUNNING_ARGS" | grep -oE -- "${FLAG}[= ][^ ]+" | head -n1 | awk '{print $2}')
+            # Handles both "--flag value" and "--flag=value" forms.
+            VAL=$(echo "$RUNNING_ARGS" | grep -oE -- "${FLAG}[= ][^ ]+" | head -n1 | sed -E "s|^${FLAG}[= ]||")
             if [ -n "$VAL" ]; then
                 printf '    %-28s %s\n' "$FLAG" "$VAL"
             else
@@ -848,7 +906,11 @@ do_diagnose() {
     if [ "$ORPHAN_COUNT" -gt 0 ] && [ "$RECLAIM" -gt $((REAL_KB / 2)) ]; then
         echo "  => Most of your cache is ORPHANED and invisible to rclone's quota."
         echo "     That is why the size limit never kicks in. Reclaim it with:"
-        echo "         ./setup_gdrive_mount.sh clear-cache"
+        echo "         systemctl --user stop ${SERVICE_NAME}.service"
+        echo "         ./setup_gdrive_mount.sh purge-orphans"
+        echo "         systemctl --user start ${SERVICE_NAME}.service"
+        echo "     (purge-orphans removes ONLY untracked files, so anything"
+        echo "      pending upload is left alone - unlike clear-cache.)"
     elif [ "$DIRTY_COUNT" -gt 0 ] && [ "$DIRTY_BYTES" -gt $((REAL_KB * 1024 / 2)) ]; then
         echo "  => Most of your cache is PENDING UPLOAD and cannot be evicted."
         echo "     Fix the uploads (check the log above); do not delete the cache."
@@ -1137,8 +1199,10 @@ do_setup() {
     fi
 
     # Type=notify makes systemd wait for the mount to be ready and surfaces
-    # live VFS cache stats in `systemctl --user status`. rclone gained systemd
-    # notify support in 1.52; fall back to `simple` on anything older.
+    # live VFS cache stats in `systemctl --user status`. sd-notify support has
+    # been in rclone for many years (well before 1.52); the >=1.52 gate below
+    # is a conservative floor, not the version it was introduced in. Anything
+    # older falls back to `simple`, which still works.
     SERVICE_TYPE="simple"
     RCLONE_VER=$(rclone version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
     if [ -n "$RCLONE_VER" ]; then

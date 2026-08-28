@@ -259,7 +259,7 @@ TIME         FILES    REMAINING         RATE ETA
 ```
 
 It samples every 30s, reports rate and ETA, exits `0` when the backlog clears,
-and exits `1` if nothing moves for 5 minutes so a genuinely stalled queue is
+and exits `1` if nothing moves for 15 minutes so a genuinely stalled queue is
 distinguishable from a merely slow one.
 
 ### Is it safe to restart mid-upload?

@@ -87,6 +87,186 @@ do_status() {
     fi
 }
 
+do_doctor() {
+    echo ""
+    echo "=========================================================="
+    echo "  Mount Startup Diagnosis"
+    echo "=========================================================="
+    PROBLEMS=0
+
+    # --- 1. Is rclone where the unit expects it? -------------------
+    echo ""
+    echo "--- 1. rclone binary ---"
+    UNIT_FILE="${SYSTEMD_USER_DIR}/${SERVICE_NAME}.service"
+    EXEC_BIN=$(grep -oE "^ExecStart=[^ ]+" "$UNIT_FILE" 2>/dev/null | cut -d= -f2) || EXEC_BIN=""
+    REAL_BIN=$(command -v rclone 2>/dev/null) || REAL_BIN=""
+    echo "    Unit expects : ${EXEC_BIN:-<no unit file>}"
+    echo "    Actually at  : ${REAL_BIN:-<not on PATH>}"
+    if [ -n "$EXEC_BIN" ] && [ ! -x "$EXEC_BIN" ]; then
+        echo "    [X] ${EXEC_BIN} is missing or not executable."
+        [ -n "$REAL_BIN" ] && echo "        Fix: re-run ./setup_gdrive_mount.sh setup (picks up ${REAL_BIN})"
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        echo "    [OK]"
+    fi
+
+    # --- 2. Config file and remote ---------------------------------
+    echo ""
+    echo "--- 2. Config and remote '${REMOTE_NAME}' ---"
+    if [ ! -f "$RCLONE_CONF" ]; then
+        echo "    [X] No config at ${RCLONE_CONF}"
+        echo "        This alone makes rclone exit 1 immediately."
+        echo "        Fix: copy it from the working machine:"
+        echo "          scp olduser@oldhost:~/.config/rclone/rclone.conf ${RCLONE_CONF}"
+        PROBLEMS=$((PROBLEMS + 1))
+    elif ! grep -q "^\[${REMOTE_NAME}\]" "$RCLONE_CONF"; then
+        echo "    [X] Config exists but has no [${REMOTE_NAME}] section."
+        echo "        Remotes found: $(grep -oE '^\[[^]]+\]' "$RCLONE_CONF" | tr '\n' ' ')"
+        echo "        The unit mounts '${REMOTE_NAME}:' - names must match."
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        echo "    [OK] ${RCLONE_CONF} has [${REMOTE_NAME}]"
+        if [ -n "$REAL_BIN" ]; then
+            echo "    Testing remote access (5s)..."
+            if timeout 15 rclone lsd "${REMOTE_NAME}:" --config "$RCLONE_CONF" \
+                 --low-level-retries 1 --retries 1 >/dev/null 2>/tmp/.rc_err; then
+                echo "    [OK] Remote responds."
+            else
+                echo "    [X] Cannot reach the remote:"
+                sed 's/^/        /' /tmp/.rc_err | head -n 6
+                echo "        A stale or unauthorised token exits 1 at startup."
+                echo "        Fix: rclone config reconnect ${REMOTE_NAME}:"
+                PROBLEMS=$((PROBLEMS + 1))
+            fi
+            rm -f /tmp/.rc_err
+        fi
+    fi
+
+    # --- 3. FUSE availability --------------------------------------
+    echo ""
+    echo "--- 3. FUSE ---"
+    if [ ! -e /dev/fuse ]; then
+        echo "    [X] /dev/fuse missing - the kernel module is not loaded."
+        echo "        Fix: sudo modprobe fuse"
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        echo "    [OK] /dev/fuse present"
+    fi
+    if ! command -v fusermount3 &>/dev/null && ! command -v fusermount &>/dev/null; then
+        echo "    [X] No fusermount/fusermount3 binary."
+        echo "        Fix: sudo dnf install fuse3   (or apt install fuse3)"
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        FUSEBIN=$(command -v fusermount3 2>/dev/null) || FUSEBIN=$(command -v fusermount 2>/dev/null) || FUSEBIN="?"
+        echo "    [OK] ${FUSEBIN}"
+    fi
+
+    # --allow-other requires user_allow_other in /etc/fuse.conf. This is
+    # the classic "works on the old box, fails on the new one" difference,
+    # because the old machine was configured months ago and forgotten.
+    if grep -q -- "--allow-other" "$UNIT_FILE" 2>/dev/null; then
+        if [ -f /etc/fuse.conf ] && grep -qE "^[[:space:]]*user_allow_other" /etc/fuse.conf; then
+            echo "    [OK] user_allow_other enabled (needed by --allow-other)"
+        else
+            echo "    [X] The unit uses --allow-other but /etc/fuse.conf does NOT"
+            echo "        have user_allow_other. rclone exits 1 immediately."
+            echo "        Fix: echo user_allow_other | sudo tee -a /etc/fuse.conf"
+            echo "        (or drop --allow-other from the unit)"
+            PROBLEMS=$((PROBLEMS + 1))
+        fi
+    fi
+
+    # --- 4. Mountpoint ---------------------------------------------
+    echo ""
+    echo "--- 4. Mountpoint ${MOUNT_DIR} ---"
+    if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
+        echo "    [!] Already mounted. A stale mount blocks a new one."
+        echo "        Fix: fusermount -u -z ${MOUNT_DIR}"
+        PROBLEMS=$((PROBLEMS + 1))
+    elif [ ! -d "$MOUNT_DIR" ]; then
+        echo "    [X] Does not exist. Fix: mkdir -p ${MOUNT_DIR}"
+        PROBLEMS=$((PROBLEMS + 1))
+    elif [ -n "$(ls -A "$MOUNT_DIR" 2>/dev/null)" ]; then
+        echo "    [!] Not empty - rclone refuses to mount over existing files:"
+        ls -A "$MOUNT_DIR" | head -n 5 | sed 's/^/        /'
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        echo "    [OK] exists and is empty"
+    fi
+
+    # --- 5. The actual error ---------------------------------------
+    echo ""
+    echo "--- 5. rclone's own error output ---"
+    echo "    systemd only reports 'status=1'; the real message goes to"
+    echo "    the log file. Most recent errors:"
+    if [ -f "${CACHE_DIR}/rclone.log" ]; then
+        ERRS=$(grep -iE "error|fatal|failed|cannot|denied" "${CACHE_DIR}/rclone.log" 2>/dev/null | tail -n 8)
+        if [ -n "$ERRS" ]; then
+            echo "$ERRS" | sed 's/^/      /'
+        else
+            echo "      (none logged - rclone may be failing before it opens the log)"
+        fi
+    else
+        echo "      (no log file - rclone is failing before it can create one,"
+        echo "       which points at a bad flag, missing config, or FUSE issue)"
+    fi
+    echo ""
+    echo "    To see the error directly, run the mount in the foreground:"
+    echo "        ./setup_gdrive_mount.sh trymount"
+
+    echo ""
+    echo "=========================================================="
+    if [ "$PROBLEMS" -eq 0 ]; then
+        echo "  No blocking problems found - run 'trymount' to see the error."
+    else
+        echo "  ${PROBLEMS} problem(s) found above."
+    fi
+    echo "=========================================================="
+    echo ""
+}
+
+do_trymount() {
+    echo ""
+    echo "=== Foreground Mount Test ==="
+    echo "Runs the unit's exact command WITHOUT --log-file, so rclone's error"
+    echo "prints here instead of disappearing into the log. Ctrl-C to stop."
+    echo ""
+
+    UNIT_FILE="${SYSTEMD_USER_DIR}/${SERVICE_NAME}.service"
+    if [ ! -f "$UNIT_FILE" ]; then
+        echo "[!] No unit at ${UNIT_FILE}. Run setup first."
+        return 1
+    fi
+
+    if systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
+        echo "[!] Service is running; stop it first:"
+        echo "      systemctl --user stop ${SERVICE_NAME}.service"
+        return 1
+    fi
+
+    # Rebuild the ExecStart line: join continuations, drop the systemd
+    # prefix, expand %h, and strip --log-file so output comes to the
+    # terminal. Add -vv for the full reason.
+    CMD=$(sed -n '/^ExecStart=/,/[^\\]$/p' "$UNIT_FILE" \
+          | tr '\n' ' ' | sed 's/\\ / /g; s/^ExecStart=//' \
+          | sed "s|%h|${HOME}|g" \
+          | sed -E 's/--log-file[= ][^ ]+//; s/--log-level[= ][^ ]+//')
+
+    echo "Running:"
+    echo "  ${CMD} -vv"
+    echo ""
+    echo "--- rclone output ---"
+    # shellcheck disable=SC2086
+    timeout 25 $CMD -vv 2>&1 | tail -n 40
+    RC=${PIPESTATUS[0]}
+    echo "--- exit ${RC} ---"
+    if [ "$RC" -eq 124 ]; then
+        echo ""
+        echo "[OK] It ran for 25s without exiting - the mount itself works."
+        echo "     Unmount with: fusermount -u -z ${MOUNT_DIR}"
+    fi
+}
+
 do_reupload() {
     VFS_DIR="${CACHE_DIR}/vfs"
     VFS_META_DIR="${CACHE_DIR}/vfsMeta"
@@ -1312,6 +1492,12 @@ case "$1" in
         ;;
     logtail)
         do_logtail
+        ;;
+    doctor)
+        do_doctor
+        ;;
+    trymount)
+        do_trymount
         ;;
     reupload)
         shift

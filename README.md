@@ -68,6 +68,49 @@ loginctl enable-linger $USER
 
 ---
 
+## Troubleshooting: Service Won't Start
+
+If `systemctl --user start` fails with `status=1/FAILURE`, run:
+
+```bash
+./setup_gdrive_mount.sh doctor
+```
+
+systemd only reports the exit code — rclone's actual error goes to
+`--log-file`, which is why `journalctl` shows nothing useful. `doctor` checks
+each startup prerequisite and, if needed, `trymount` runs the unit's exact
+command in the foreground *without* `--log-file` so the real message prints:
+
+```bash
+./setup_gdrive_mount.sh trymount
+```
+
+### Works on one machine but not another
+
+Nearly always one of these, in order of likelihood:
+
+1. **`user_allow_other` not set.** The unit uses `--allow-other`, which
+   requires `user_allow_other` in `/etc/fuse.conf`. Your working machine was
+   configured months ago; a fresh one hasn't been. rclone exits 1 instantly
+   with `fusermount: option allow_other only allowed if 'user_allow_other' is
+   set`. Fix:
+   ```bash
+   echo user_allow_other | sudo tee -a /etc/fuse.conf
+   ```
+2. **No `rclone.conf`**, or it lacks a `[gdrive]` section. The config is *not*
+   transferred by cloning this repo — copy it across:
+   ```bash
+   scp olduser@oldhost:~/.config/rclone/rclone.conf ~/.config/rclone/
+   ```
+3. **Expired or revoked OAuth token** — common when a config is copied between
+   machines: `rclone config reconnect gdrive:`
+4. **rclone not at `/usr/bin/rclone`** (distro vs. manual install). Re-running
+   setup regenerates the unit with the correct path.
+5. **Mountpoint missing, non-empty, or already mounted** —
+   `fusermount -u -z ~/mnt/google_drive`
+
+---
+
 ## Managing the VFS Cache (Disk Usage)
 
 With `--vfs-cache-mode full`, every byte you read or write passes through a
@@ -324,6 +367,8 @@ slowness; `./setup_gdrive_mount.sh uploads` will identify that case.
 - **Disable Auto-Start**: `systemctl --user disable --now rclone-gdrive.service`
 - **View Logs**: `tail -f ~/.cache/rclone/rclone.log`
 - **Cache Usage**: `./setup_gdrive_mount.sh cache`
+- **Service Won't Start**: `./setup_gdrive_mount.sh doctor`
+- **See Real Startup Error**: `./setup_gdrive_mount.sh trymount`
 - **Diagnose Cache Bloat**: `./setup_gdrive_mount.sh diagnose`
 - **Pending Uploads / Failures**: `./setup_gdrive_mount.sh uploads`
 - **Upload Speed Check**: `./setup_gdrive_mount.sh speedcheck`

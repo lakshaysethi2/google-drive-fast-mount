@@ -157,7 +157,6 @@ case "\${1:-}" in
         --vfs-cache-mode full \\
         --vfs-cache-max-size ${VFS_CACHE_MAX_SIZE} \\
         --vfs-cache-max-age ${VFS_CACHE_MAX_AGE} \\
-        --vfs-cache-min-free-space ${VFS_CACHE_MIN_FREE} \\
         --vfs-cache-poll-interval ${VFS_CACHE_POLL_INTERVAL} \\
         --allow-other \\
         --poll-interval 1m \\
@@ -167,13 +166,8 @@ case "\${1:-}" in
         --vfs-read-chunk-size-limit 1G \\
         --buffer-size 32M \\
         --transfers ${TRANSFERS} \\
-        --drive-chunk-size ${DRIVE_CHUNK_SIZE} \\
-        --drive-upload-cutoff ${DRIVE_CHUNK_SIZE} \\
-        --drive-pacer-min-sleep ${DRIVE_PACER_MIN_SLEEP} \\
-        --drive-pacer-burst ${DRIVE_PACER_BURST} \\
+$(printf "${OPT_FLAGS_RUNNER}")
         --log-file "\$LOG" \\
-        --stats 30s \\
-        --stats-one-line \\
         --log-level INFO${MOUNT_FLAGS} >>"\$STARTUP_LOG" 2>&1 &
     echo \$! > "\$PIDFILE"
     sleep 3
@@ -1617,6 +1611,58 @@ do_setup() {
         echo "[i] Mounting in read-write mode."
     fi
 
+    # Ask the binary which flags it actually understands. Distro builds lag
+    # upstream (Ubuntu 22.04 ships 1.60, which has no
+    # --vfs-cache-min-free-space), and rclone treats an unknown flag as a
+    # fatal error - the mount never starts. Probing beats hardcoding a
+    # version table, since it also covers -DEV builds with backported flags.
+    RCLONE_MOUNT_HELP=$("$RCLONE_BIN" mount --help 2>&1) || RCLONE_MOUNT_HELP=""
+    RCLONE_GLOBAL_HELP=$("$RCLONE_BIN" help flags 2>&1) || RCLONE_GLOBAL_HELP=""
+    supports_flag() {
+        case "${RCLONE_MOUNT_HELP}${RCLONE_GLOBAL_HELP}" in
+            *"$1"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    # Built incrementally so unsupported flags are simply omitted.
+    OPT_FLAGS=""          # 4-space indent, for the systemd unit
+    OPT_FLAGS_RUNNER=""   # 8-space indent, for the standalone runner
+    SKIPPED_FLAGS=""
+    add_flag() {  # add_flag <flag> <value-or-empty>
+        if supports_flag "$1"; then
+            if [ -n "${2:-}" ]; then
+                OPT_FLAGS="${OPT_FLAGS}    $1 $2 \\\\\n"
+                OPT_FLAGS_RUNNER="${OPT_FLAGS_RUNNER}        $1 $2 \\\\\n"
+            else
+                OPT_FLAGS="${OPT_FLAGS}    $1 \\\\\n"
+                OPT_FLAGS_RUNNER="${OPT_FLAGS_RUNNER}        $1 \\\\\n"
+            fi
+        else
+            SKIPPED_FLAGS="${SKIPPED_FLAGS} $1"
+        fi
+    }
+
+    add_flag --vfs-cache-min-free-space "${VFS_CACHE_MIN_FREE}"
+    add_flag --drive-chunk-size         "${DRIVE_CHUNK_SIZE}"
+    add_flag --drive-upload-cutoff      "${DRIVE_CHUNK_SIZE}"
+    add_flag --drive-pacer-min-sleep    "${DRIVE_PACER_MIN_SLEEP}"
+    add_flag --drive-pacer-burst        "${DRIVE_PACER_BURST}"
+    add_flag --stats                    "30s"
+    add_flag --stats-one-line           ""
+
+    if [ -n "$SKIPPED_FLAGS" ]; then
+        echo "[!] rclone $("$RCLONE_BIN" version 2>/dev/null | head -n1 | awk '{print $2}') does not support:${SKIPPED_FLAGS}"
+        echo "    Omitting them so the mount can start. To get them, upgrade:"
+        echo "      sudo -v ; curl https://rclone.org/install.sh | sudo bash"
+        case "$SKIPPED_FLAGS" in
+            *vfs-cache-min-free-space*)
+                echo "    NOTE: without --vfs-cache-min-free-space the cache is bounded"
+                echo "          only by --vfs-cache-max-size (${VFS_CACHE_MAX_SIZE}), not by free disk."
+                ;;
+        esac
+    fi
+
     # Type=notify makes systemd wait for the mount to be ready and surfaces
     # live VFS cache stats in `systemctl --user status`. sd-notify support has
     # been in rclone for many years (well before 1.52); the >=1.52 gate below
@@ -1652,7 +1698,6 @@ ExecStart=${RCLONE_BIN} mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --vfs-cache-mode full \\
     --vfs-cache-max-size ${VFS_CACHE_MAX_SIZE} \\
     --vfs-cache-max-age ${VFS_CACHE_MAX_AGE} \\
-    --vfs-cache-min-free-space ${VFS_CACHE_MIN_FREE} \\
     --vfs-cache-poll-interval ${VFS_CACHE_POLL_INTERVAL} \\
     --allow-other \\
     --poll-interval 1m \\
@@ -1662,13 +1707,8 @@ ExecStart=${RCLONE_BIN} mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --vfs-read-chunk-size-limit 1G \\
     --buffer-size 32M \\
     --transfers ${TRANSFERS} \\
-    --drive-chunk-size ${DRIVE_CHUNK_SIZE} \\
-    --drive-upload-cutoff ${DRIVE_CHUNK_SIZE} \\
-    --drive-pacer-min-sleep ${DRIVE_PACER_MIN_SLEEP} \\
-    --drive-pacer-burst ${DRIVE_PACER_BURST} \\
+$(printf "${OPT_FLAGS}")
     --log-file ${CACHE_DIR}/rclone.log \\
-    --stats 30s \\
-    --stats-one-line \\
     --log-level INFO${MOUNT_FLAGS}
 ExecStop=${FUSERMOUNT_BIN} -u -z ${MOUNT_DIR}
 Restart=on-failure

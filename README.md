@@ -68,6 +68,41 @@ loginctl enable-linger $USER
 
 ---
 
+## Running Without systemd (Docker, WSL, chroot)
+
+Containers normally have no systemd as PID 1, so `systemctl --user` fails with:
+
+```text
+System has not been booted with systemd as init system (PID 1). Can't operate.
+Failed to connect to user scope bus via local transport: No such file or directory
+```
+
+The setup script detects this and generates a standalone runner instead:
+
+```bash
+~/.local/bin/rclone-gdrive-mount start|stop|restart|status
+```
+
+It runs the identical rclone command (same cache limits, same upload tuning,
+same read-only choice), tracks the process with a PID file, and clears stale
+FUSE endpoints on start just as `ExecStartPre` does.
+
+> [!IMPORTANT]
+> FUSE inside a container requires the **host** to grant permission. Without
+> these flags the mount fails regardless of how it is started:
+> ```bash
+> docker run --cap-add SYS_ADMIN --device /dev/fuse \
+>            --security-opt apparmor:unconfined ...
+> ```
+> These are broad privileges. On a normal Linux host the systemd user service
+> is the better option — it needs no elevated capabilities.
+
+Note that a container is not a good place for a persistent Drive mount unless
+you specifically need it there: the mount disappears with the container, and
+propagating it to the host requires `rshared` bind-mount propagation.
+
+---
+
 ## Troubleshooting: Service Won't Start
 
 If `systemctl --user start` fails with `status=1/FAILURE`, run:

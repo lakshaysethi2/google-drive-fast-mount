@@ -159,6 +159,7 @@ do_doctor() {
     else
         FUSEBIN=$(command -v fusermount3 2>/dev/null) || FUSEBIN=$(command -v fusermount 2>/dev/null) || FUSEBIN="?"
         echo "    [OK] ${FUSEBIN}"
+        FUSERMOUNT_FIX="$FUSEBIN"
     fi
 
     # --allow-other requires user_allow_other in /etc/fuse.conf. This is
@@ -176,13 +177,42 @@ do_doctor() {
         fi
     fi
 
+    # ExecStop/ExecStartPre must point at a binary that exists. fuse3-only
+    # distros (Arch) have no /bin/fusermount, so a unit generated elsewhere
+    # fails to clean up, leaving a stale mount that blocks every restart.
+    for LINE in ExecStop ExecStartPre; do
+        UBIN=$(grep -oE "^${LINE}=-?[^ ]+" "$UNIT_FILE" 2>/dev/null | head -n1 | sed -E "s/^${LINE}=-?//") || UBIN=""
+        if [ -n "$UBIN" ] && [ ! -x "$UBIN" ]; then
+            echo "    [X] ${LINE} points at ${UBIN}, which does not exist."
+            echo "        Unmount-on-stop cannot run, so a failed start leaves a"
+            echo "        stale mount that blocks every retry (restart loop)."
+            echo "        Fix: re-run ./setup_gdrive_mount.sh setup"
+            PROBLEMS=$((PROBLEMS + 1))
+        fi
+    done
+
+    if ! grep -q "^ExecStartPre=" "$UNIT_FILE" 2>/dev/null; then
+        echo "    [!] Unit has no ExecStartPre cleanup. If a start ever fails"
+        echo "        mid-mount, the leftover endpoint blocks all retries."
+        echo "        Fix: re-run ./setup_gdrive_mount.sh setup"
+    fi
+
     # --- 4. Mountpoint ---------------------------------------------
     echo ""
     echo "--- 4. Mountpoint ${MOUNT_DIR} ---"
     if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-        echo "    [!] Already mounted. A stale mount blocks a new one."
-        echo "        Fix: fusermount -u -z ${MOUNT_DIR}"
-        PROBLEMS=$((PROBLEMS + 1))
+        if systemctl --user is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+            echo "    [OK] Mounted and the service is running."
+        else
+            echo "    [X] STALE MOUNT: mounted, but the service is NOT running."
+            echo "        This is the classic restart loop: rclone cannot mount"
+            echo "        over a live endpoint, so every retry exits 1."
+            echo "        Fix:"
+            echo "          systemctl --user stop ${SERVICE_NAME}.service"
+            echo "          ${FUSERMOUNT_FIX:-fusermount3} -u -z ${MOUNT_DIR}"
+            echo "          systemctl --user start ${SERVICE_NAME}.service"
+            PROBLEMS=$((PROBLEMS + 1))
+        fi
     elif [ ! -d "$MOUNT_DIR" ]; then
         echo "    [X] Does not exist. Fix: mkdir -p ${MOUNT_DIR}"
         PROBLEMS=$((PROBLEMS + 1))
@@ -1370,6 +1400,31 @@ do_setup() {
         fi
     fi
 
+    # Locate fusermount. Arch and other fuse3-only distros ship
+    # /usr/bin/fusermount3 with no fuse2 compatibility symlink, so a
+    # hardcoded /bin/fusermount makes ExecStop fail silently. When that
+    # happens a failed start leaves the FUSE endpoint mounted, and every
+    # retry then hits "mountpoint is not empty" - an endless restart loop.
+    FUSERMOUNT_BIN=""
+    for CAND in /usr/bin/fusermount3 /bin/fusermount3 /usr/bin/fusermount /bin/fusermount; do
+        if [ -x "$CAND" ]; then FUSERMOUNT_BIN="$CAND"; break; fi
+    done
+    if [ -z "$FUSERMOUNT_BIN" ]; then
+        echo "[!] No fusermount/fusermount3 found. Install fuse3:"
+        echo "      Arch:   sudo pacman -S fuse3"
+        echo "      Debian: sudo apt install fuse3"
+        echo "      Fedora: sudo dnf install fuse3"
+        return 1
+    fi
+    echo "[i] Using ${FUSERMOUNT_BIN} for unmounting."
+
+    # Likewise resolve rclone rather than assuming /usr/bin/rclone: manual
+    # installs and Homebrew land in /usr/local/bin, and systemd needs an
+    # absolute path (units run without a useful PATH).
+    RCLONE_BIN=$(command -v rclone 2>/dev/null) || RCLONE_BIN=""
+    [ -z "$RCLONE_BIN" ] && RCLONE_BIN="/usr/bin/rclone"
+    echo "[i] Using ${RCLONE_BIN} as the rclone binary."
+
     MOUNT_FLAGS=""
     if [ "$READ_ONLY" = true ]; then
         MOUNT_FLAGS=" --read-only"
@@ -1403,7 +1458,11 @@ Wants=network-online.target
 
 [Service]
 Type=${SERVICE_TYPE}
-ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
+# Clear any stale FUSE endpoint left by a previous failed start, otherwise
+# rclone refuses to mount over it and the service restart-loops forever.
+# '-' prefix: ignore failure when there is nothing mounted (the normal case).
+ExecStartPre=-${FUSERMOUNT_BIN} -u -z ${MOUNT_DIR}
+ExecStart=${RCLONE_BIN} mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --config ${RCLONE_CONF} \\
     --cache-dir ${CACHE_DIR} \\
     --vfs-cache-mode full \\
@@ -1427,7 +1486,7 @@ ExecStart=/usr/bin/rclone mount ${REMOTE_NAME}: ${MOUNT_DIR} \\
     --stats 30s \\
     --stats-one-line \\
     --log-level INFO${MOUNT_FLAGS}
-ExecStop=/bin/fusermount -u -z ${MOUNT_DIR}
+ExecStop=${FUSERMOUNT_BIN} -u -z ${MOUNT_DIR}
 Restart=on-failure
 RestartSec=10
 

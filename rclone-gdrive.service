@@ -14,6 +14,11 @@ Type=notify
 #
 # NOTE: systemd runs units without HOME/PATH, so `~` is NOT expanded by rclone.
 # --config and --cache-dir must always be absolute paths.
+# Clear a stale FUSE endpoint left by a previous failed start; without this
+# rclone hits "mountpoint is not empty" and the service restart-loops.
+# NOTE: on fuse3-only distros (Arch) the binary is fusermount3; on Debian it
+# may be /bin/fusermount. Running the setup script picks the right one.
+ExecStartPre=-/usr/bin/fusermount3 -u -z %h/mnt/google_drive
 ExecStart=/usr/bin/rclone mount gdrive: %h/mnt/google_drive \
     --config %h/.config/rclone/rclone.conf \
     --cache-dir %h/.cache/rclone \
@@ -38,7 +43,7 @@ ExecStart=/usr/bin/rclone mount gdrive: %h/mnt/google_drive \
     --log-level INFO \
     --stats 30s \
     --stats-one-line
-ExecStop=/bin/fusermount -u -z %h/mnt/google_drive
+ExecStop=/usr/bin/fusermount3 -u -z %h/mnt/google_drive
 Restart=on-failure
 RestartSec=10
 

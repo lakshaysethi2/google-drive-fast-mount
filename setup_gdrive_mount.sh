@@ -114,6 +114,10 @@ PIDFILE="${PIDFILE}"
 RCLONE_BIN="${RCLONE_BIN}"
 FUSERMOUNT_BIN="${FUSERMOUNT_BIN}"
 LOG="${CACHE_DIR}/rclone.log"
+# rclone writes fatal startup errors (FUSE denied, bad flag, missing config)
+# to stderr and exits BEFORE --log-file is ever opened, so those never reach
+# \$LOG. Capture stderr separately or the failure is invisible.
+STARTUP_LOG="${CACHE_DIR}/rclone-startup.log"
 
 is_running() {
     [ -f "\$PIDFILE" ] || return 1
@@ -129,7 +133,24 @@ case "\${1:-}" in
     mkdir -p "\$MOUNT_DIR" "\$CACHE_DIR"
     # Clear any stale endpoint from a previous crash
     "\$FUSERMOUNT_BIN" -u -z "\$MOUNT_DIR" 2>/dev/null || true
+
+    # Preflight: prove FUSE actually works before blaming rclone. In a
+    # container this is the usual failure, and the kernel error is far
+    # clearer than anything rclone reports.
+    if [ ! -e /dev/fuse ]; then
+        echo "[X] /dev/fuse does not exist inside this container."
+        echo "    Add to docker-compose.yml:  devices: [\"/dev/fuse:/dev/fuse\"]"
+        echo "    and load it on the HOST:    sudo modprobe fuse"
+        exit 1
+    fi
+    if [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
+        echo "[X] /dev/fuse exists but is not readable/writable by \$(id -un)."
+        echo "    \$(ls -l /dev/fuse)"
+        echo "    Fix: add the user to the 'fuse' group, or run privileged."
+        exit 1
+    fi
     echo "[+] Starting rclone mount..."
+    : > "\$STARTUP_LOG"
     nohup "\$RCLONE_BIN" mount ${REMOTE_NAME}: "\$MOUNT_DIR" \\
         --config ${RCLONE_CONF} \\
         --cache-dir "\$CACHE_DIR" \\
@@ -153,17 +174,48 @@ case "\${1:-}" in
         --log-file "\$LOG" \\
         --stats 30s \\
         --stats-one-line \\
-        --log-level INFO${MOUNT_FLAGS} >/dev/null 2>&1 &
+        --log-level INFO${MOUNT_FLAGS} >>"\$STARTUP_LOG" 2>&1 &
     echo \$! > "\$PIDFILE"
     sleep 3
-    if is_running; then
+    if is_running && mountpoint -q "\$MOUNT_DIR" 2>/dev/null; then
         echo "[✓] Started (PID \$(cat "\$PIDFILE")). Mount: \$MOUNT_DIR"
+    elif is_running; then
+        echo "[!] Process is alive but \$MOUNT_DIR is not mounted yet."
+        echo "    Give it a few seconds, then: \$0 status"
     else
-        echo "[X] Failed to start. Last log lines:"
-        tail -n 15 "\$LOG" 2>/dev/null | sed 's/^/    /'
+        echo "[X] Failed to start."
         echo ""
-        echo "    In a container FUSE needs:"
-        echo "      --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined"
+        echo "--- rclone startup error (stderr) ---"
+        if [ -s "\$STARTUP_LOG" ]; then
+            sed 's/^/    /' "\$STARTUP_LOG"
+        else
+            echo "    (nothing on stderr)"
+        fi
+        if [ -s "\$LOG" ]; then
+            echo "--- last log lines ---"
+            tail -n 10 "\$LOG" 2>/dev/null | sed 's/^/    /'
+        fi
+        echo ""
+        # Decode the usual container failures into a concrete fix.
+        ERRTXT=\$(cat "\$STARTUP_LOG" 2>/dev/null)
+        if echo "\$ERRTXT" | grep -qi "operation not permitted\|permission denied"; then
+            echo "    => The kernel refused the FUSE mount."
+            echo "       Host:      sudo modprobe fuse"
+            echo "       Compose:   devices: [\"/dev/fuse:/dev/fuse\"]"
+            echo "                  security_opt: [apparmor:unconfined]"
+            echo "       Then recreate: docker compose down && docker compose up -d"
+        elif echo "\$ERRTXT" | grep -qi "fusermount.*not found\|no such file"; then
+            echo "    => fusermount is missing inside the container."
+            echo "       Install it: sudo apt-get update && sudo apt-get install -y fuse3"
+        elif echo "\$ERRTXT" | grep -qi "unknown flag\|unknown command"; then
+            echo "    => This rclone build does not support one of the flags above."
+            echo "       Upgrade it: sudo -v ; curl https://rclone.org/install.sh | sudo bash"
+        elif echo "\$ERRTXT" | grep -qi "didn't find section\|couldn't find section"; then
+            echo "    => The remote '${REMOTE_NAME}' is missing from the rclone config."
+        elif echo "\$ERRTXT" | grep -qi "directory is not empty\|mountpoint"; then
+            echo "    => Mountpoint busy or not empty:"
+            echo "       \$FUSERMOUNT_BIN -u -z \$MOUNT_DIR"
+        fi
         rm -f "\$PIDFILE"
         exit 1
     fi

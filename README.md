@@ -70,6 +70,21 @@ loginctl enable-linger $USER
 
 ## Running Without systemd (Docker, WSL, chroot)
 
+A ready-made compose file is included: [`docker-compose.example.yml`](docker-compose.example.yml)
+(LinuxServer webtop, but the FUSE and volume settings apply to any image).
+
+> [!CAUTION]
+> **LinuxServer images use `/config` as the user's home directory.** If you do
+> not bind-mount it, then `docker compose down` destroys
+> `/config/.config/rclone/rclone.conf` (your Drive credentials) **and**
+> `/config/.cache/rclone/vfs` — which is the only copy of any file that has
+> not finished uploading. Always mount it:
+> ```yaml
+> volumes:
+>   - ./config:/config
+> ```
+
+
 Containers normally have no systemd as PID 1, so `systemctl --user` fails with:
 
 ```text

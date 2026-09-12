@@ -1,0 +1,87 @@
+# Example: LinuxServer webtop with a working rclone Google Drive mount.
+#
+# The container has no systemd, so setup_gdrive_mount.sh detects that and
+# generates ~/.local/bin/rclone-gdrive-mount instead of a systemd unit.
+#
+# Usage:
+#   mkdir -p ./config && sudo chown -R 1000:1000 ./config
+#   docker compose up -d
+#   docker exec -it hawkins-tv-webtop bash
+#     git clone https://github.com/lakshaysethi2/google-drive-fast-mount.git
+#     cd google-drive-fast-mount
+#     git checkout arena/019fa187-google-drive-fast-mount
+#     ./setup_gdrive_mount.sh setup
+
+services:
+  webtop:
+    image: lscr.io/linuxserver/webtop:ubuntu-kde
+    container_name: hawkins-tv-webtop
+
+    # ---------------------------------------------------------------
+    # CRITICAL: /config is the abc user's HOME inside LinuxServer
+    # images. Without this bind mount everything under it is destroyed
+    # whenever the container is recreated - including
+    #   /config/.config/rclone/rclone.conf  (your Drive credentials)
+    #   /config/.cache/rclone/vfs           (files not yet uploaded)
+    # Pending uploads exist ONLY in that cache, so losing it loses data.
+    # ---------------------------------------------------------------
+    volumes:
+      - ./config:/config
+
+      # Optional: expose the mount to the host as well. Requires
+      # bind-propagation=rshared, otherwise the host sees an empty dir.
+      # The host path must exist first: mkdir -p /mnt/hawkins-gdrive
+      # - type: bind
+      #   source: /mnt/hawkins-gdrive
+      #   target: /config/mnt/google_drive
+      #   bind:
+      #     propagation: rshared
+
+    # ---------------------------------------------------------------
+    # FUSE access. `privileged: true` is already very broad and covers
+    # this, but the device is declared explicitly so the mount still
+    # works if you later drop privileged (see the hardened block below).
+    # The fuse module must be loaded on the HOST:
+    #   lsmod | grep fuse || sudo modprobe fuse
+    #   echo fuse | sudo tee /etc/modules-load.d/fuse.conf   # persist
+    # ---------------------------------------------------------------
+    devices:
+      - /dev/fuse:/dev/fuse
+
+    # KDE needs privileged per LinuxServer's docs (fakeroot).
+    privileged: true
+
+    security_opt:
+      - seccomp:unconfined
+      # AppArmor blocks FUSE mounts on Ubuntu/Debian hosts even when
+      # seccomp is unconfined. Harmless on hosts without AppArmor
+      # (Arch, Fedora) - Docker ignores it there.
+      - apparmor:unconfined
+
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Pacific/Auckland
+      - TITLE=Hawkins-tv
+
+    shm_size: '4gb'
+    ports:
+      - 7238:3000
+    restart: unless-stopped
+
+# ---------------------------------------------------------------------
+# Hardened alternative, if you can drop KDE's privileged requirement
+# (e.g. switching to the xfce image). Grants only what FUSE needs
+# instead of effectively-root on the host:
+#
+#   cap_add:
+#     - SYS_ADMIN
+#   devices:
+#     - /dev/fuse:/dev/fuse
+#   security_opt:
+#     - apparmor:unconfined
+#   # privileged: true   <- omit
+#
+# Note SYS_ADMIN is still a wide capability; a rootless systemd user
+# service on the Arch host needs none of this.
+# ---------------------------------------------------------------------
